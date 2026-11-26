@@ -1,12 +1,41 @@
-<p align="center">
-  <img src="assets/logo.png" width="200" alt="Logo">
-</p>
+# VIctory fork (work in progress)
 
-<div align="center">
+> **About this repository.** It is published as snapshots, one commit each,
+> without upstream's history: [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
+> at commit `d510ee4a` (2026-11-25), itself a fork of
+> [VIctory](https://github.com/Marvisak/VIctory), with the changes listed
+> under [Changes in this snapshot](#changes-in-this-snapshot) made on top in
+> November 2026. From "Status of this fork" down, the text is that fork's
+> README as it stood at that commit: its measurements and its test machine,
+> not this snapshot's.
 
-# ViceRecomp
+A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
+compatibility layer that runs an Xbox Series title natively on Windows from
+files the user supplies. This fork follows upstream
+`main` and adds fixes aimed at one goal: getting the game's world to render
+correctly and playably on one particular PC.
 
-</div>
+**This repository contains no game files, code or assets.** You need your own
+copy of the game. It is not affiliated with or endorsed by the game's
+developer or publisher.
+
+## Credits
+
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
+  contributors is the base of everything here: the loader, the runtime
+  services, the Direct3D 12 back end and the shader recompiler. Licensed
+  GPL-3.0-or-later; so is this fork. This repository carries no history; it
+  is in the two upstream repositories.
+- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
+  (GPL-2.0-only) was used as a reference for how the same title behaves under
+  another layer. Fixes inspired by it were written anew in VIctory's code.
+- The guard over every view of a memory page is code by **myokex**
+  ([victory-amd](https://github.com/myokex/victory-amd), commit `c6dc4d8`), which
+  adapts pull request #115 here by Spexivus, its correction by joroyt and a part of
+  VIctory #1122 by tightfall. The read-beside fix for kernel reads into title
+  memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
+  are carried here unchanged apart from one merge conflict.
+- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
 ## Changes in this snapshot
 
