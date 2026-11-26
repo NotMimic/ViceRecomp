@@ -1,0 +1,27 @@
+name: Import ViceRecomp source
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download source repository
+        run: |
+          curl -fL https://github.com/darkworldhm/victory-fork-darkworldhm/archive/refs/heads/main.zip -o source.zip
+          unzip -q source.zip
+          cp -a victory-fork-darkworldhm-main/. .
+          rm -rf source.zip victory-fork-darkworldhm-main
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Import ViceRecomp source files"
+            git push origin HEAD:main
+          fi
