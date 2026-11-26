@@ -1,0 +1,2680 @@
+//! Texture contents the title writes itself (decision 0007, "Texture
+//! memory"): streamed pages, layout-library copies, movie frames, glyph
+//! atlases. Such a texture lives in console memory in its tiled layout;
+//! before a submission samples its host copy, the memory is detiled into a
+//! staging buffer when its content changed, and the staging buffer is
+//! copied into the host texture.
+//!
+//! "Changed" means a page of the memory was written since the last detiling
+//! ([`crate::watch`]), in write-watched memory; in physical-page views,
+//! which cannot be watched, a content hash of the whole memory at every
+//! submission that samples it.
+//!
+//! shortcut: a change detiles the whole texture, not the pages written.
+//! Only textures read through descriptor tables are brought up to date
+//! (directly indexed views are not known per draw); plane 0 is uploaded
+//! (every mip and array slice), depth and stencil planes are not.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
+
+use windows::Win32::Graphics::Direct3D12::*;
+
+use crate::host::{HostList, host};
+use crate::object::This;
+
+macro_rules! once {
+    ($($arg:tt)*) => {{
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!($($arg)*));
+    }};
+}
+
+/// A texture's upload state: the staging buffer laid out as the host
+/// texture's subresources, and what was last detiled.
+pub(crate) struct Staging {
+    buffer: ID3D12Resource,
+    /// Its bytes.
+    #[cfg(feature = "diagnostics")]
+    size: u64,
+    data: *mut u8,
+    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    rows: Vec<u32>,
+    layout: victory_formats::texture::Layout,
+    /// Mips per array slice.
+    mips: u32,
+    /// The staging buffer's bytes (counted in `STAGED` while it lives).
+    bytes: u64,
+    memory: *const u8,
+    last: Mutex<Last>,
+    /// Whether the staging buffer was detiled since a submitted list last
+    /// uploaded it, and whether one has uploaded it at all: a list records
+    /// the upload only then. (Every list that sampled a title texture
+    /// uploaded all of it again, changed or not: 5,411 subresource copies
+    /// of 1,120 textures in one frame of run 18.)
+    dirty: std::sync::atomic::AtomicBool,
+    uploaded: std::sync::atomic::AtomicBool,
+    /// When a list last recorded a use of it (`crate::host::moment`).
+    used: std::sync::atomic::AtomicU64,
+    /// The frame until which the next check may hash the texture again
+    /// ([`Last::due_until`]), for [`upload`], which runs on the recording
+    /// threads and does not take `last`.
+    hot: std::sync::atomic::AtomicU64,
+    /// Diagnostics ([`trace_seconds`]): the way the last check went
+    /// ([`Staging::took`]).
+    #[cfg(feature = "diagnostics")]
+    path: std::sync::atomic::AtomicU8,
+    /// Diagnostics ([`trace_seconds`]): a list recorded the copy of the
+    /// staging buffer into the host texture since the last check.
+    #[cfg(feature = "diagnostics")]
+    armed: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "diagnostics")]
+    trace: Mutex<Trace>,
+    /// Levels on demand (`crate::tiles`): the texture's host copy was made
+    /// without memory of its own when the staging buffer was made.
+    on_demand: bool,
+    /// For such a texture: the levels that were the title's at the last
+    /// detiling (a bit a level; the staging buffer holds zeros for the
+    /// others), and what that was judged by ([`Staging::judgement`]).
+    detiled: std::sync::atomic::AtomicU32,
+    judged: [std::sync::atomic::AtomicU64; 2],
+    /// For such a texture: when an upload last left a held level without
+    /// tiles (`crate::host::moment`, never 0; 0: none did). The upload is
+    /// recorded again about a second later if the card has room by then
+    /// ([`upload`]).
+    waiting: std::sync::atomic::AtomicU64,
+    /// The size of the buffer if it came from the pool of spare staging
+    /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
+    /// own, released when this is dropped.
+    pooled: u64,
+}
+
+/// A staging buffer nothing holds: the buffer and where it is mapped.
+struct Spare(ID3D12Resource, usize);
+
+// SAFETY: a D3D12 buffer and its mapping, touched by nobody while it is
+// spare.
+unsafe impl Send for Spare {}
+
+/// Spare staging buffers by size (a power of two), and their bytes in all.
+static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
+    Mutex::new((std::collections::BTreeMap::new(), 0));
+/// The most bytes kept spare, and the largest buffer that is pooled.
+const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
+/// Staging buffers taken from the spare ones, and made, since the start.
+pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A mapped upload buffer of `total` bytes for a texture's staging, all
+/// zeros, and its pool size (0: not pooled).
+///
+/// Every texture the title streams in got a buffer of its own from the
+/// host and gave it back when its staging went: about a quarter of a
+/// millisecond to make (run 213's profile: 25 ms a frame on the recording
+/// threads for some 100 uploads, most of it the graphics kernel waiting)
+/// and more to free on the thread that submits. A streaming burst is 200
+/// to 500 uploads in a frame (run 222), and those are the frames that
+/// dip. Buffers of up to 8 MiB are now kept by size and used again,
+/// zeroed as a new one is (levels not there yet must read as zeros).
+/// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
+fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let size = total.max(64 << 10).next_power_of_two();
+    if size > SPARE_MOST.1 || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
+        return host.upload_buffer(total, crate::cardmem::Owner::Staging).map(|(buffer, data)| (buffer, data, 0));
+    }
+    let spare = {
+        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = all.0.get_mut(&size).and_then(Vec::pop);
+        if taken.is_some() {
+            all.1 -= size;
+        }
+        taken
+    };
+    if let Some(Spare(buffer, data)) = spare {
+        SPARE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: the buffer's own mapping, `size` bytes, which nothing
+        // else holds.
+        unsafe { std::ptr::write_bytes(data as *mut u8, 0, total as usize) };
+        return Some((buffer, data as *mut u8, size));
+    }
+    SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    host.upload_buffer(size, crate::cardmem::Owner::Staging).map(|(buffer, data)| (buffer, data, size))
+}
+
+/// Diagnostics ([`trace_seconds`]): what one texture's host copy shows.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct Trace {
+    /// The memory's hash (its first 8 bytes) at the last detiling: what
+    /// the staging buffer holds.
+    staged: u64,
+    /// What the host texture holds after the last submission that checked
+    /// it.
+    host: u64,
+    /// The memory's distinct contents found at checks, the newest last.
+    seen: Vec<u64>,
+    checks: u64,
+}
+
+/// What a texture's staging buffer holds: the hash of the memory detiled
+/// (memory not watched), or the write-watch asking it was detiled after.
+#[derive(Default)]
+struct Last {
+    hash: Option<blake3::Hash>,
+    asked: u64,
+    /// The frame a partly mapped texture was last read in.
+    partial: Option<u64>,
+    /// Until this frame the texture is hashed at every check: its memory
+    /// changed behind the guard's back (a write through another view of
+    /// the same pages, as a video decoder's planes get) when last hashed.
+    hot_until: u64,
+    /// The frame the hash last found the texture changed in. The texture's
+    /// next check hashes it once more (`verify`): if it changed again it is
+    /// hot. A texture that streams in changes once and is not hashed on. A
+    /// video's planes cycle through a ring of textures, each sampled only
+    /// every third frame, so "again" cannot mean "the next frame".
+    changed_at: u64,
+    verify: bool,
+}
+
+/// How many frames a texture that keeps changing stays hashed at every
+/// check after its last change.
+const HOT_FRAMES: u64 = 24;
+/// How long after a change the next check still counts as "again".
+const VERIFY_FRAMES: u64 = 24;
+
+impl Last {
+    /// The hash found the texture changed in `frame`.
+    fn changed(&mut self, frame: u64) {
+        if (self.verify && frame <= self.changed_at + VERIFY_FRAMES) || frame < self.hot_until {
+            self.hot_until = frame + HOT_FRAMES;
+        }
+        self.changed_at = frame;
+        self.verify = true;
+    }
+
+    /// The hash found the texture as it was in `frame`. With `repeat`, a
+    /// check in the frame right after the change leaves the verifying on:
+    /// the frame may sample the same video frame again.
+    fn unchanged(&mut self, frame: u64, repeat: bool) {
+        if repeat && frame <= self.changed_at + 1 {
+            return;
+        }
+        self.verify = false;
+    }
+
+    /// Whether the hash is due at `frame` whatever the turns say.
+    fn hash_due(&self, frame: u64) -> bool {
+        frame < self.hot_until || (self.verify && frame > self.changed_at && frame <= self.changed_at + VERIFY_FRAMES)
+    }
+
+    /// The frame until which the next check may hash the texture again
+    /// ([`hash_due`](Self::hash_due)).
+    fn due_until(&self) -> u64 {
+        let verifying = if self.verify { self.changed_at + VERIFY_FRAMES + 1 } else { 0 };
+        self.hot_until.max(verifying)
+    }
+}
+
+/// How a texture that changes behind the guard's back is followed
+/// (`VICTORY_TEXTURE_HOT`): 0, on its turns only (every eighth frame); 1,
+/// hashed at every check while it keeps changing ([`Last::hash_due`]); 2
+/// (default), as 1, a check in the frame right after a change does not
+/// end the verifying, and while the next check may hash the texture every
+/// list that samples it records the copy into its host texture.
+fn hot_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var_os("VICTORY_TEXTURE_HOT") {
+        Some(v) if v == "0" => 0,
+        Some(v) if v == "1" => 1,
+        _ => 2,
+    })
+}
+
+/// Diagnostics: for how many seconds from the first texture check every
+/// check also hashes the texture's memory and says which of its contents
+/// the host copy shows after the submission (`VICTORY_TEXTURE_TRACE=<s>`).
+#[cfg(feature = "diagnostics")]
+fn trace_seconds() -> Option<f64> {
+    static SECONDS: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *SECONDS.get_or_init(|| std::env::var("VICTORY_TEXTURE_TRACE").ok().and_then(|v| v.parse().ok()))
+}
+
+/// Whether the trace is on now.
+#[cfg(feature = "diagnostics")]
+fn tracing_now() -> bool {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    trace_seconds().is_some_and(|s| START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() < s)
+}
+
+/// The first 8 bytes of `bytes`' hash.
+#[cfg(feature = "diagnostics")]
+fn hash8(bytes: &[u8]) -> u64 {
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&blake3::hash(bytes).as_bytes()[..8]);
+    u64::from_le_bytes(first)
+}
+
+// SAFETY: the staging mapping is written only at submission, under
+// `last`'s lock; the title memory is only read.
+unsafe impl Send for Staging {}
+// SAFETY: as above.
+unsafe impl Sync for Staging {}
+
+static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+
+/// Every staging state, grouped by the address where its texture's title
+/// memory starts. [`STAGING`] is keyed by resource, which cannot answer
+/// "which textures lie in this memory range?"; this index can, so a remap
+/// does not have to scan every staged texture.
+///
+/// Several textures can start at the same address (for example two
+/// formats viewing the same memory), hence the `Vec`. Entries are `Weak`
+/// so the index never keeps a staging buffer alive on its own; entries
+/// whose staging state is gone are removed by [`prune_address_index`].
+static STAGED_BY_ADDRESS: Mutex<std::collections::BTreeMap<usize, Vec<Weak<Staging>>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// The size in bytes of the largest texture ever staged. A texture that
+/// overlaps some memory range cannot start more than this many bytes
+/// before the range, which bounds the search in [`remapped`].
+static LARGEST_STAGED_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Adds a newly made staging state to [`STAGED_BY_ADDRESS`].
+fn add_to_address_index(staging: &Arc<Staging>) {
+    let (start, bytes) = staging.memory();
+    LARGEST_STAGED_BYTES.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+    let mut index = STAGED_BY_ADDRESS.lock().unwrap_or_else(|e| e.into_inner());
+    let entries = index.entry(start).or_default();
+    // A texture staged here before may have been let go since.
+    entries.retain(|entry| entry.strong_count() > 0);
+    entries.push(Arc::downgrade(staging));
+}
+
+/// Removes entries of [`STAGED_BY_ADDRESS`] whose staging state was let go.
+fn prune_address_index() {
+    let mut index = STAGED_BY_ADDRESS.lock().unwrap_or_else(|e| e.into_inner());
+    index.retain(|_, entries| {
+        entries.retain(|entry| entry.strong_count() > 0);
+        !entries.is_empty()
+    });
+}
+
+/// Called when the runtime maps or unmaps title memory `[at, at + len)`.
+///
+/// A texture in that range may now show completely different bytes, but
+/// its staging state still says "uploaded and unchanged". In that state
+/// [`upload`] skips the copy and only schedules a check, so the first list
+/// that samples the texture after the remap reads the old texels, and the
+/// new ones only arrive one list later (#574).
+///
+/// Marking the texture dirty makes its next [`upload`] record the copy.
+/// The check that runs when that list is submitted reads the new memory
+/// into the staging buffer before the copy executes, so the very first
+/// list after the remap sees the new texels.
+pub(crate) fn remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    for staging in staged_under(at, at.saturating_add(len)) {
+        staging.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The staging states whose texture memory overlaps `[at, end)`.
+fn staged_under(at: usize, end: usize) -> Vec<Arc<Staging>> {
+    if end <= at {
+        return Vec::new();
+    }
+    let earliest_start = at.saturating_sub(LARGEST_STAGED_BYTES.load(std::sync::atomic::Ordering::Relaxed));
+    let index = STAGED_BY_ADDRESS.lock().unwrap_or_else(|e| e.into_inner());
+    // Textures that start before `end`, and are not so far below `at` that
+    // they cannot reach it...
+    index
+        .range(earliest_start..end)
+        .flat_map(|(_, entries)| entries.iter().filter_map(Weak::upgrade))
+        // ...of which only those whose memory reaches past `at` overlap the
+        // range.
+        .filter(|staging| {
+            let (start, bytes) = staging.memory();
+            start.saturating_add(bytes) > at
+        })
+        .collect()
+}
+
+/// `VICTORY_TABLED_REREAD`: whether a texture draws read through a table
+/// is read again whole once a write the guards do not see (DirectStorage's
+/// reads into physical pages) has settled in its memory after its upload.
+///
+/// Such a texture keeps its staging buffer and is checked at every
+/// submission that samples it ([`Staging::refresh`]). That check skips the
+/// read while the guards saw no write to the texture's blocks, unless it is
+/// the texture's turn (one frame in eight) or the texture changed lately. A
+/// write into the physical pages through the runtime's own view does not
+/// fault at the guard: the check sees it only if bit 1 of
+/// `VICTORY_PAGE_WRITES` opened the blocks, or at the texture's turn. The
+/// texture pass, which makes slots of textures picked by index due again
+/// after such writes, leaves out the slots draws read through tables
+/// (`crate::descriptor::host` `slots_written_under`, `tabled_lately`), and
+/// drops a table's slot from its rechecks (`crate::draw` `heap_textures`).
+///
+/// On (default): a staged texture that was uploaded when such a write
+/// landed in its memory settles as those slots do
+/// (`crate::descriptor::host::page_settle`) and is then read again whole:
+/// what its staging buffer was filled from is forgotten, so the check at
+/// the next submission that samples it reads and detiles the memory, and
+/// the list uploads it. A texture uploaded while its memory was all zero,
+/// before DirectStorage brought its texels, is one of these. At most
+/// [`REREAD_MOST`] textures and [`REREAD_MOST_BYTES`] of their memory a
+/// frame; the rest wait for the next frame. `0`: left to their own checks,
+/// as before.
+pub(crate) fn tabled_reread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_REREAD").is_none_or(|v| v != "0"))
+}
+
+/// Staged textures one frame reads again at most ([`tabled_reread`]).
+/// shortcut: not a measured value; the same as the slots one pass makes due
+/// (`crate::descriptor::host` `SETTLE_MOST`).
+const REREAD_MOST: usize = 64;
+
+/// The bytes of title memory of the staged textures one frame reads again
+/// at most ([`tabled_reread`]); the first is taken whatever its size.
+/// shortcut: not a measured value. In the owner's session a slow frame
+/// spent 193 ms preparing 198 MB of textures; 16 MB is a share of that size.
+const REREAD_MOST_BYTES: u64 = 16 << 20;
+
+/// Since the start ([`tabled_reread`]): staged textures found uploaded
+/// under a write the guards do not see (once per written range); of those,
+/// ones that were settling already; settled ones read again and their bytes
+/// of title memory; settled ones let go of, or not uploaded, by then; and
+/// how many are settling now.
+pub(crate) static TABLED_REREAD: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Things settling under writes the guards do not see, by key: the moments
+/// (ms) of the first and of the last write noted under each, the bytes of
+/// its memory, and what the pass acts on once its writes settled.
+struct Settling<V> {
+    map: std::collections::BTreeMap<usize, (u64, u64, u64, V)>,
+}
+
+impl<V> Settling<V> {
+    const fn new() -> Self {
+        Self {
+            map: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// A write under `key` at `now`; `value` for a key not settling yet.
+    /// Whether it was settling already.
+    fn note(&mut self, key: usize, now: u64, bytes: u64, value: impl FnOnce() -> V) -> bool {
+        if let Some(entry) = self.map.get_mut(&key) {
+            entry.1 = now;
+            return true;
+        }
+        self.map.insert(key, (now, now, bytes, value()));
+        false
+    }
+
+    /// Takes the ones whose writes settled by `now`: no write for `quiet`
+    /// ms, or `longest` ms since the first. Oldest first, at most `most` of
+    /// them and `most_bytes` of their memory (the first whatever its size);
+    /// the rest stay for the next call.
+    fn settled(&mut self, now: u64, quiet: u64, longest: u64, most: usize, most_bytes: u64) -> Vec<V> {
+        let mut ready: Vec<(u64, usize, u64)> = self
+            .map
+            .iter()
+            .filter(|(_, e)| now.saturating_sub(e.1) >= quiet || now.saturating_sub(e.0) >= longest)
+            .map(|(&key, e)| (e.0, key, e.2))
+            .collect();
+        ready.sort_unstable();
+        let mut taken = Vec::new();
+        let mut bytes = 0u64;
+        for (_, key, size) in ready {
+            if taken.len() >= most || (!taken.is_empty() && bytes.saturating_add(size) > most_bytes) {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            if let Some((.., value)) = self.map.remove(&key) {
+                taken.push(value);
+            }
+        }
+        taken
+    }
+}
+
+/// Staged textures settling under writes the guards do not see
+/// ([`tabled_reread`]), by the address of their staging state; the `Weak`
+/// keeps that allocation, so no other state takes the key meanwhile.
+static SETTLING_STAGED: Mutex<Settling<Weak<Staging>>> = Mutex::new(Settling::new());
+
+/// The frame [`page_settled`] last ran in.
+static SETTLED_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Title memory `ranges` (start, end) was written behind the guards' back
+/// (taken by the texture pass from `crate::descriptor::host::page_written`)
+/// at `now` (ms): the staged textures there that were uploaded settle
+/// ([`tabled_reread`]). One not uploaded yet takes the bytes that are there
+/// by its upload.
+pub(crate) fn page_written(ranges: &[(u64, u64)], now: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let found: Vec<Arc<Staging>> = ranges
+        .iter()
+        .flat_map(|&(start, end)| staged_under(start as usize, end as usize))
+        .filter(|staging| staging.uploaded.load(Relaxed))
+        .collect();
+    if found.is_empty() {
+        return;
+    }
+    let mut settling = SETTLING_STAGED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut again = 0;
+    for staging in &found {
+        let bytes = staging.memory().1 as u64;
+        if settling.note(Arc::as_ptr(staging) as usize, now, bytes, || Arc::downgrade(staging)) {
+            again += 1;
+        }
+    }
+    TABLED_REREAD[0].fetch_add(found.len() as u64, Relaxed);
+    TABLED_REREAD[1].fetch_add(again, Relaxed);
+    TABLED_REREAD[5].store(settling.len() as u64, Relaxed);
+}
+
+/// Once in `frame`: the staged textures whose writes settled by `now` (ms;
+/// no write for `quiet` ms, or `longest` since the first; at most
+/// [`REREAD_MOST`] and [`REREAD_MOST_BYTES`]) and that are still uploaded
+/// are read again whole at the next submission that samples them, and that
+/// submission's list uploads them ([`tabled_reread`]). Returns how many.
+pub(crate) fn page_settled(frame: u64, now: u64, quiet: u64, longest: u64) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    if SETTLED_FRAME.swap(frame, Relaxed) == frame {
+        return 0;
+    }
+    let settled = {
+        let mut settling = SETTLING_STAGED.lock().unwrap_or_else(|e| e.into_inner());
+        if settling.map.is_empty() {
+            return 0;
+        }
+        let settled = settling.settled(now, quiet, longest, REREAD_MOST, REREAD_MOST_BYTES);
+        TABLED_REREAD[5].store(settling.len() as u64, Relaxed);
+        settled
+    };
+    let (mut read, mut bytes, mut gone) = (0, 0, 0);
+    for staging in settled {
+        match staging.upgrade() {
+            Some(staging) if staging.uploaded.load(Relaxed) => {
+                // Forgotten, the next check reads and detiles the memory
+                // whatever the guards say; dirty, the next list that
+                // samples the texture records its upload.
+                staging.forget();
+                staging.dirty.store(true, Relaxed);
+                read += 1;
+                bytes += staging.memory().1 as u64;
+            }
+            _ => gone += 1,
+        }
+    }
+    TABLED_REREAD[2].fetch_add(read, Relaxed);
+    TABLED_REREAD[3].fetch_add(bytes, Relaxed);
+    TABLED_REREAD[4].fetch_add(gone, Relaxed);
+    read as usize
+}
+
+/// The buffer a texture the host writes is copied through into the texture
+/// of a view the title placed in its memory in another format
+/// ([`alias`]): every level of every layer as each of the two formats lays
+/// it out for a copy (the same bytes: the texels are as wide), the written
+/// texture's layout first.
+struct Through {
+    buffer: ID3D12Resource,
+    parts: Vec<(
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    )>,
+}
+
+/// The most levels times layers [`alias`] copies (a cube of nine levels).
+const ALIAS_PARTS: u32 = 54;
+
+// SAFETY: a device-local buffer only lists record copies with.
+unsafe impl Send for Through {}
+// SAFETY: as above.
+unsafe impl Sync for Through {}
+
+/// The copy buffers of [`alias`], by the placed view's texture.
+static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
+
+/// Brings `placed`, the texture of a view the title placed in the memory
+/// of `source` in another format (`crate::resource::alias_of`), up to date
+/// with what the host wrote to `source`: the texels of every level and
+/// layer are copied as they are, through a buffer (the host copies between
+/// two formats of one texel width in no other way). Recorded the first time
+/// the list reads the view
+/// and again whenever the list used `source` in another way since (wrote
+/// it, or read it itself). Leaves `placed` in the copy destination state,
+/// as [`upload`] does. False if the copy cannot be made: the caller fills
+/// the texture from title memory, as before.
+pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+    const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    let (Some(to), Some(from)) = (
+        crate::resource::host_resource(placed),
+        crate::resource::host_resource(source),
+    ) else {
+        return false;
+    };
+    let Some(host) = host() else { return false };
+    let through = {
+        let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(HashMap::new);
+        match map.get(&(placed as usize)) {
+            Some(through) => through.clone(),
+            None => {
+                // SAFETY: live textures.
+                let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
+                // Levels times layers (a volume's slices are one part).
+                let count = |d: &D3D12_RESOURCE_DESC| {
+                    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                        1
+                    } else {
+                        u32::from(d.DepthOrArraySize)
+                    };
+                    u32::from(d.MipLevels) * layers
+                };
+                let parts = count(&of_from);
+                if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
+                    return false;
+                }
+                let mut rows = [(); 2]
+                    .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
+                let mut bytes = [0u64; 2];
+                // SAFETY: plain queries; the out pointers are ours and
+                // hold `parts` layouts each.
+                unsafe {
+                    host.device.GetCopyableFootprints(
+                        &of_from,
+                        0,
+                        parts,
+                        0,
+                        Some(rows[0].as_mut_ptr()),
+                        None,
+                        None,
+                        Some(&mut bytes[0]),
+                    );
+                    host.device.GetCopyableFootprints(
+                        &of_to,
+                        0,
+                        parts,
+                        0,
+                        Some(rows[1].as_mut_ptr()),
+                        None,
+                        None,
+                        Some(&mut bytes[1]),
+                    );
+                }
+                let alike = rows[0].iter().zip(&rows[1]).all(|(a, b)| {
+                    let (fa, fb) = (a.Footprint, b.Footprint);
+                    a.Offset == b.Offset
+                        && (fa.Width, fa.Height, fa.Depth, fa.RowPitch)
+                            == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
+                });
+                if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
+                    return false;
+                }
+                let Some(buffer) = host.uav_buffer(bytes[0], crate::cardmem::Owner::Aliases) else {
+                    return false;
+                };
+                crate::host::name(&buffer, || {
+                    format!(
+                        "alias copy {}x{} f{} to f{}",
+                        of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
+                    )
+                });
+                tracing::info!(
+                    view = ?placed,
+                    texture = ?source,
+                    width = of_from.Width,
+                    height = of_from.Height,
+                    parts,
+                    written_as = of_from.Format.0,
+                    read_as = of_to.Format.0,
+                    "a view placed in the memory of a texture the host writes, in another format: read from that texture by a copy on the host"
+                );
+                let [of_written, of_read] = rows;
+                let through = Arc::new(Through {
+                    buffer,
+                    parts: of_written.into_iter().zip(of_read).collect(),
+                });
+                map.insert(placed as usize, through.clone());
+                through
+            }
+        }
+    };
+    let first = list.first_use(placed as usize);
+    // The source's first use in the list records nothing (its prelude
+    // brings it to the state); a use in another way since the last copy
+    // shows as a change of state.
+    let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
+        let state = crate::host::legal_state(texture, COPY_SOURCE);
+        let barrier = crate::host::transition(
+            texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(state as i32),
+        );
+        // SAFETY: an open list and a live texture.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        before
+    });
+    if !first && before.is_none() {
+        return true;
+    }
+    card_writes(list, placed, to, None);
+    crate::list::ensure_state(list, placed, COPY_DEST);
+    let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: index as u32,
+        },
+    };
+    let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(&through.buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: *row,
+        },
+    };
+    let (common, read, written) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
+    // SAFETY: an open list and live resources; the buffer is as big as
+    // the footprints and rests in the common state between copies.
+    unsafe {
+        list.list
+            .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+        for (index, (of_written, _)) in through.parts.iter().enumerate() {
+            list.list
+                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+        }
+        list.list
+            .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
+        for (index, (_, of_read)) in through.parts.iter().enumerate() {
+            list.list
+                .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+        }
+        list.list
+            .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
+    }
+    list.keep(&through.buffer);
+    // A draw that also writes the source (a view of it handled before
+    // this one) needs it in that state again; the next read of the alias
+    // then copies once more, as it must after a write.
+    if let Some(before) = before
+        && before & TARGET_OR_UNORDERED != 0
+    {
+        crate::list::ensure_state(list, source, before);
+    }
+    true
+}
+
+/// Whether a texture refresh that finds the runtime remapping title memory
+/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
+/// default).
+///
+/// A texture whose memory is all mapped is read in place, under a lock
+/// the runtime takes alone while it changes a mapping
+/// (`crate::watch::title_memory_reading`), so that no page goes away under
+/// the read. While the world streams in the runtime remaps all the time,
+/// and each of the frame's 150-360 refreshes waited for it: runs 99-101
+/// have 4, 15 and 16 frame lines with over 300 ms of "textures", up to
+/// 3,708 ms, and on every one of them the wait for this lock is the whole
+/// of it (1,345 of 1,381 ms; 3,630 of 3,708; the write-watch askings 3-12
+/// ms, the texture's own lock 0).
+///
+/// With the switch the refresh asks for the lock without waiting. If the
+/// runtime has it, the texture is read through the kernel instead, which
+/// needs no lock: it fails if a page is not there, and then the texture is
+/// left as it is and read at its next refresh, a frame later. A read
+/// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
+///
+/// What changes for the picture: a texture that arrives while the runtime
+/// is remapping may show a frame later. It never shows partly read.
+fn no_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line, with [`no_wait`]: refreshes that read
+/// through the kernel because title memory was being remapped, and those
+/// left for the next refresh because a page was not there.
+pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Since the last frame-rate line, of texture refreshes on every thread, in
+/// microseconds: waiting for the texture's own lock (another thread is
+/// refreshing the same texture), asking the write watch and the guards,
+/// waiting for title memory to hold still (the lock the runtime takes
+/// alone while it remaps, `crate::watch::title_memory_reading`), and the
+/// refreshes in all.
+///
+/// While the world streams in, the frame line's "textures" is seconds a
+/// frame in some runs and tenths in others for the same megabytes (2,566
+/// ms for 110 MB in run 93, 314 ms for 132 MB in run 91; before these
+/// counters, runs 81, 83, 85 and 94 each had lines of 1.5-2.9 s), and the
+/// submitting thread is not running while it lasts (run 93: 240-310 ms of
+/// its own time a frame beside 1,100-1,800 ms of "textures"): it waits.
+/// These say for what.
+pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
+fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    let us = started.elapsed().as_micros() as u64;
+    REFRESH_WAITS[slot].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+    if slot == 2 {
+        crate::framelog::add(crate::framelog::T::RefreshStillUs, us);
+    }
+    out
+}
+
+thread_local! {
+    /// Room to read a texture's memory into: one buffer per thread that
+    /// checks textures (the submitting one, and the kept threads it hands
+    /// its checks to: `crate::host`'s `Checks`). Each texture kept its own,
+    /// a second copy in memory of every write-watched or partly mapped
+    /// texture ever sampled, for the run.
+    static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Calls `f` with `size` bytes of this thread's read buffer (their
+/// contents are whatever the last texture left).
+fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        if read.len() < size {
+            read.resize(size, 0);
+        }
+        f(&mut read[..size])
+    })
+}
+
+/// Whether a texture all of whose memory is mapped is read through the
+/// kernel's copy instead of in place (`VICTORY_TEXTURE_COPY=1`; off by
+/// default). Round 3 of the memory work read every such texture that way
+/// to be safe from pages taken away under the read; it cost 0.6 ms per MB
+/// against 0.3 in place (90-105 ms a frame while the world streams in, runs
+/// 72 and 73, against 20-40), and both runs with it lost the graphics
+/// device, for a reason not found. The read in place is safe now for
+/// another reason (`crate::watch::title_memory_reading`); this switch is
+/// left to tell whether the copy was what lost the device.
+fn through_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COPY").is_some_and(|v| v == "1"))
+}
+
+/// Calls `f` with the `size` bytes of title memory at `memory`, read
+/// through the kernel into this thread's read buffer; pages that are not
+/// there read as zeros. The bytes are those a read in place would see.
+fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    with_read(size, |read| {
+        crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
+        f(read)
+    })
+}
+
+/// Staging buffers alive (also those only a list still holds) and their
+/// bytes.
+static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        STAGED[0].fetch_sub(1, Relaxed);
+        STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // Nothing holds the staging any more (lists keep it until they are
+        // reset, after their submission has run): its buffer is spare.
+        if self.pooled != 0 {
+            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            if all.1 + self.pooled <= SPARE_MOST.0 {
+                all.1 += self.pooled;
+                all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
+            }
+        }
+    }
+}
+
+/// For the memory line: staging buffers alive, their bytes, and how many
+/// of them their texture still has (the others wait for a list's reset).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn memory() -> [u64; 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let kept = STAGING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, |map| map.len() as u64);
+    [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
+}
+
+/// Staging buffers let go as idle since the start, and their bytes.
+static LET_GO: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// For the memory line: staging buffers let go as idle, and their bytes.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn let_go() -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
+}
+
+/// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
+/// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
+/// texture, kept so that an unchanged texture is not uploaded again, and
+/// those of textures no longer sampled were kept for the run (2,246 of
+/// them, 2.1 GB, at the end of run 24). The next list that samples such a
+/// texture makes a staging buffer anew, detiles and uploads once more.
+/// Called before a submission starts, by the thread that submits.
+pub(crate) fn let_go_idle() {
+    use std::sync::atomic::Ordering::Relaxed;
+    const IDLE_FRAMES: u64 = 4;
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = map.as_mut() else {
+        return;
+    };
+    if map.is_empty() {
+        return;
+    }
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    // A list that recorded an upload or a check holds the staging until it
+    // is reset: one only the table holds is named by no list, recorded or
+    // running.
+    let (mut went, mut bytes) = (0u64, 0u64);
+    map.retain(|_, s| {
+        let keep = Arc::strong_count(s) > 1
+            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+        if !keep {
+            LET_GO[0].fetch_add(1, Relaxed);
+            LET_GO[1].fetch_add(s.bytes, Relaxed);
+            went += 1;
+            bytes += s.bytes;
+        }
+        keep
+    });
+    if went > 0 {
+        prune_address_index();
+        crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+    }
+}
+
+/// Textures the host GPU wrote by a copy or resolve: their contents are on
+/// the host, not in title memory, which stays as it was.
+static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+/// A host copy or resolve writes `resource`.
+pub(crate) fn host_written(resource: This) {
+    let new = {
+        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        set.get_or_insert_with(Default::default).insert(resource as usize)
+    };
+    // Diagnostics (run 177): where its title memory is, for placed views
+    // the title reads that memory through ([`placed_in_host_written`]).
+    if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
+        // SAFETY: 56 bytes in the description's layout.
+        let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
+        let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
+        if !at.is_null() && bytes > 0 {
+            HOST_WRITTEN_AT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
+        }
+    }
+}
+
+/// The title memory of textures the host copied into, by address: bytes
+/// and description words 4, 6, 7 and 8 (width, height, layers and levels,
+/// format).
+static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u32, u32, usize)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// A texture the title placed at `address` (description words `desc`) was
+/// made: says so once if it lies in the memory of a texture the host
+/// copied into ([`host_written`]). Its own host copy is filled from title
+/// memory, which the copy never reached: the copied texels are on the
+/// card in the other texture, where no shader that reads this view finds
+/// them.
+pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
+    let hit = {
+        let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+        map.range(..=address)
+            .next_back()
+            .filter(|(at, d)| address < **at + d.0)
+            .map(|(at, d)| (*at, *d))
+    };
+    if let Some((at, (bytes, width, height, layers_levels, format, _))) = hit {
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+            tracing::warn!(
+                view_address = format_args!("{address:#x}"),
+                view_offset = address - at,
+                view_width = desc[4],
+                view_height = desc[6],
+                view_layers_levels = format_args!("{:#x}", desc[7]),
+                view_format = desc[8],
+                copied_address = format_args!("{at:#x}"),
+                copied_bytes = bytes,
+                copied_width = width,
+                copied_height = height,
+                copied_layers_levels = format_args!("{layers_levels:#x}"),
+                copied_format = format,
+                "HERO LEAD: a placed texture view lies in the memory of a texture the host copied into: it is filled from title memory, which the copy never reached"
+            );
+        }
+    }
+}
+
+/// Whether the host GPU wrote `resource` by a copy or resolve
+/// ([`host_written`]): its host copy cannot be made again from title
+/// memory.
+pub(crate) fn host_wrote(resource: usize) -> bool {
+    HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&resource))
+}
+
+/// Whether the texels of a texture the card writes go back to the title
+/// memory the title's CPU reads them from ([`cpu_read`]);
+/// `VICTORY_TEXTURE_BACK=0`: that memory stays as the title left it.
+fn texture_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BACK").is_none_or(|v| v != "0"))
+}
+
+/// The most bytes of one texture that go back (`VICTORY_TEXTURE_BACK_KB`,
+/// 1024 KiB by default; the largest water simulation target is 512 KiB):
+/// a bigger texture is left alone and said, as its copy and its tiling
+/// would cost every list that writes it.
+fn texture_back_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_BACK_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+            << 10
+    })
+}
+
+/// Where every subresource of a texture lies in a read-back buffer.
+struct Parts {
+    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    rows: Vec<u32>,
+    /// The buffer's bytes.
+    total: u64,
+    /// Mips per array slice.
+    mips: u32,
+}
+
+/// A texture the card writes whose memory the title's CPU reads
+/// ([`cpu_read`]).
+pub(crate) struct CpuRead {
+    resource: usize,
+    /// The texture's console memory and its layout there.
+    memory: usize,
+    layout: victory_formats::texture::Layout,
+    /// Asked of the host at the first copy.
+    parts: std::sync::OnceLock<Parts>,
+    /// A read-back buffer per list that copies the texture out (the list's
+    /// address): a list records again only after its last run finished and
+    /// its copies landed, so its buffer is free by then.
+    buffers: Mutex<Vec<(usize, ID3D12Resource)>>,
+}
+
+impl CpuRead {
+    fn buffer(&self, list: &HostList, bytes: u64) -> Option<ID3D12Resource> {
+        let key = std::ptr::from_ref(list) as usize;
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, buffer)) = buffers.iter().find(|(l, _)| *l == key) {
+            return Some(buffer.clone());
+        }
+        let buffer = host()?.read_back_buffer(bytes, crate::cardmem::Owner::ReadBacks)?;
+        crate::host::name(&buffer, || format!("texels of {:#x} back to title memory", self.resource));
+        buffers.push((key, buffer.clone()));
+        Some(buffer)
+    }
+}
+
+/// Textures whose memory address the title was given and that the card
+/// writes, by title resource; `None`: one that cannot go back (said then).
+static CPU_READ: std::sync::RwLock<Option<HashMap<usize, Option<Arc<CpuRead>>>>> =
+    std::sync::RwLock::new(None);
+/// Whether [`CPU_READ`] holds a texture that goes back.
+static CPU_READ_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The title was given a CPU-readable address of the memory of `resource`,
+/// a render target or unordered-access texture (`Map`, or its GPU address,
+/// which on the console is one): the title reads there what the GPU wrote.
+/// The host card writes its own copy, so from now on every list that
+/// writes the texture copies it out, and the texels go to that memory when
+/// the list has run ([`written`], [`to_title`], [`land`]).
+///
+/// The title reads its eight water simulation targets
+/// so (title+0x2913410 keeps `GetGPUVirtualAddress` as a pointer); they
+/// stayed zero and boats found no water surface.
+///
+/// shortcut: the texels arrive when the list has run, later than on the
+/// console if the title reads in the same frame without waiting; XOR
+/// layouts and textures above [`texture_back_limit`] are left alone.
+pub(crate) fn cpu_read(resource: This, memory: *mut u8, desc: &crate::resource::ResourceDesc) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !texture_back() || memory.is_null() {
+        return;
+    }
+    let key = resource as usize;
+    let known = CPU_READ
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|map| map.contains_key(&key));
+    if known {
+        return;
+    }
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let said = || SAID.fetch_add(1, Relaxed) < 64;
+    let layout = crate::resource::texture_layout(desc).map(|t| t.planes[0].layout.clone());
+    let entry = match layout {
+        Some(layout) if layout.addressable() && layout.size != 0 && layout.size <= texture_back_limit() => {
+            if said() {
+                tracing::info!(
+                    ?resource,
+                    ?memory,
+                    ?desc,
+                    bytes = layout.size,
+                    "the title's CPU reads a texture the card writes: its texels go back to title memory after every list that writes it (VICTORY_TEXTURE_BACK=0: left as they were)"
+                );
+            }
+            Some(Arc::new(CpuRead {
+                resource: key,
+                memory: memory as usize,
+                layout,
+                parts: std::sync::OnceLock::new(),
+                buffers: Mutex::new(Vec::new()),
+            }))
+        }
+        layout => {
+            if said() {
+                tracing::warn!(
+                    ?resource,
+                    ?desc,
+                    bytes = layout.as_ref().map(|l| l.size),
+                    addressable = layout.as_ref().map(|l| l.addressable()),
+                    "the title's CPU reads a texture the card writes, whose texels cannot go back to title memory (no layout, an XOR mode, or above VICTORY_TEXTURE_BACK_KB): the title reads what it left there"
+                );
+            }
+            None
+        }
+    };
+    let goes_back = entry.is_some();
+    let mut map = CPU_READ.write().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(HashMap::new).entry(key).or_insert(entry);
+    if goes_back {
+        CPU_READ_ANY.store(true, Relaxed);
+    }
+}
+
+/// `list` is about to write `resource` (a render target it binds, an
+/// unordered-access view a shader of its draw names): noted in the list if
+/// the title's CPU reads the texture ([`cpu_read`]); the list's close
+/// copies the texels out ([`to_title`]).
+pub(crate) fn written(list: &HostList, resource: This) {
+    if !CPU_READ_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let read = CPU_READ
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(&(resource as usize)))
+        .is_some_and(Option::is_some);
+    if read {
+        list.note_cpu_read(resource as usize);
+    }
+}
+
+/// At the close of `list`: copies every texture it wrote that the title's
+/// CPU reads ([`written`]) into a read-back buffer; [`land`] puts the
+/// texels into title memory when the list has run.
+pub(crate) fn to_title(list: &HostList) {
+    const COPY_SOURCE: u32 = 0x800;
+    let noted = list.take_cpu_read();
+    if noted.is_empty() {
+        return;
+    }
+    let Some(host) = host() else { return };
+    for resource in noted {
+        let entry = CPU_READ
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|map| map.get(&resource).cloned().flatten());
+        let Some(entry) = entry else { continue };
+        // A target the list bound and never drew to has no state in it:
+        // nothing was written (and nothing keeps its host copy alive).
+        if !list.tracks(resource as This) {
+            continue;
+        }
+        let Some(texture) = crate::resource::host_resource(resource as This) else {
+            continue;
+        };
+        let parts = entry.parts.get_or_init(|| {
+            // SAFETY: a live resource.
+            let d = unsafe { texture.GetDesc() };
+            let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                u32::from(d.MipLevels)
+            } else {
+                u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
+            };
+            let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+            let mut rows = vec![0u32; count as usize];
+            let mut total = 0;
+            // SAFETY: outputs for `count` subresources.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &d,
+                    0,
+                    count,
+                    0,
+                    Some(footprints.as_mut_ptr()),
+                    Some(rows.as_mut_ptr()),
+                    None,
+                    Some(&mut total),
+                );
+            }
+            Parts {
+                footprints,
+                rows,
+                total,
+                mips: u32::from(d.MipLevels).max(1),
+            }
+        });
+        if parts.total == 0 || parts.total == u64::MAX {
+            once!(resource = format_args!("{resource:#x}"), "a texture the title's CPU reads has no copyable footprint on the host: its texels do not go back");
+            continue;
+        }
+        let Some(buffer) = entry.buffer(list, parts.total) else {
+            continue;
+        };
+        crate::list::ensure_state(list, resource as This, COPY_SOURCE);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            format!(
+                "texels of {resource:#x} back to title memory at {:#x}: {} subresources, {} bytes",
+                entry.memory,
+                parts.footprints.len(),
+                parts.total
+            )
+        });
+        for (i, footprint) in parts.footprints.iter().enumerate() {
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: i as u32,
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(&buffer) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: *footprint,
+                },
+            };
+            // SAFETY: an open list; both locations name live resources.
+            unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        }
+        list.defer_texture_back(buffer, entry);
+    }
+}
+
+/// Puts the linear rows of every subresource of a texture (`linear`, laid
+/// out as `footprints` and `rows` say) into its console memory `tiled`.
+pub(crate) fn tile_all(
+    layout: &victory_formats::texture::Layout,
+    mips: u32,
+    footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    rows: &[u32],
+    linear: &[u8],
+    tiled: &mut [u8],
+) -> Result<(), victory_formats::texture::Error> {
+    for (i, (footprint, &rows)) in footprints.iter().zip(rows).enumerate() {
+        let (mip, slice) = (i as u32 % mips, i as u32 / mips);
+        let pitch = footprint.Footprint.RowPitch as usize;
+        let from = footprint.Offset as usize;
+        let depth_pitch = pitch * rows as usize;
+        let len = (depth_pitch * footprint.Footprint.Depth as usize).min(linear.len().saturating_sub(from));
+        let rows = linear
+            .get(from..from + len)
+            .ok_or(victory_formats::texture::Error::TooSmall)?;
+        layout.tile(tiled, mip, slice, rows, pitch, depth_pitch)?;
+    }
+    Ok(())
+}
+
+/// After the list that copied them ran ([`to_title`]): the texels in
+/// `buffer` go to the texture's title memory, in the console's layout.
+pub(crate) fn land(buffer: &ID3D12Resource, entry: &Arc<CpuRead>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Held while the memory is written: the title's release of the texture
+    // ([`forget`]), after which the memory may be another texture's, waits.
+    let map = CPU_READ.read().unwrap_or_else(|e| e.into_inner());
+    let registered = map
+        .as_ref()
+        .and_then(|map| map.get(&entry.resource))
+        .and_then(Option::as_ref)
+        .is_some_and(|e| Arc::ptr_eq(e, entry));
+    let Some(parts) = entry.parts.get() else { return };
+    let size = entry.layout.size as usize;
+    if !registered || !committed(entry.memory as *const u8, size) {
+        return;
+    }
+    let mut data = std::ptr::null_mut();
+    // SAFETY: a read-back buffer of `parts.total` bytes the card has
+    // filled; the texture's memory is committed and holds `size` bytes.
+    let (result, nonzero) = unsafe {
+        if buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+            once!("a read-back buffer of texels for title memory could not be mapped");
+            return;
+        }
+        let linear = std::slice::from_raw_parts(data.cast::<u8>().cast_const(), parts.total as usize);
+        let tiled = std::slice::from_raw_parts_mut(entry.memory as *mut u8, size);
+        let result = tile_all(&entry.layout, parts.mips, &parts.footprints, &parts.rows, linear, tiled);
+        static LANDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = LANDED.fetch_add(1, Relaxed) + 1;
+        let nonzero = count
+            .is_power_of_two()
+            .then(|| (count, tiled.iter().filter(|&&b| b != 0).count()));
+        buffer.Unmap(0, None);
+        (result, nonzero)
+    };
+    if let Err(error) = result {
+        once!(?error, resource = format_args!("{:#x}", entry.resource), "texels of a texture the title's CPU reads did not fit its console layout");
+    }
+    if let Some((count, nonzero)) = nonzero {
+        tracing::info!(
+            count,
+            resource = format_args!("{:#x}", entry.resource),
+            memory = format_args!("{:#x}", entry.memory),
+            bytes = size,
+            nonzero,
+            "texels the card wrote put into title memory"
+        );
+    }
+}
+
+/// The title released a resource.
+pub(crate) fn forget(resource: usize) {
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = map.as_mut() {
+        map.remove(&resource);
+    }
+    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(set) = set.as_mut() {
+        set.remove(&resource);
+    }
+    // Its memory may be given to other textures now (run 177: most of the
+    // "HERO LEAD" lines were views in memory a released texture had held).
+    HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
+    let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(through) = through.as_mut() {
+        through.remove(&resource);
+    }
+    let mut read = CPU_READ.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(read) = read.as_mut() {
+        read.remove(&resource);
+    }
+}
+
+/// Whether `resource`'s host copy takes its contents from title memory:
+/// a texture the host GPU does not render to or write.
+pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
+    const TARGET_DEPTH_UNORDERED: i32 = 0x7;
+    // SAFETY: a live resource.
+    unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+}
+
+/// Records, once per list, the copy of `resource`'s staging buffer into
+/// its host copy, and the detiling that refreshes the staging buffer at
+/// submission if the memory changed. Leaves the texture in the copy
+/// destination state.
+pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    let host_written = HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(resource as usize)));
+    // shortcut: a texture the host copied into keeps the host's contents
+    // even if the title later writes its memory too.
+    if host_written || !list.first_use(resource as usize) {
+        return;
+    }
+    let Some(staging) = staging(resource, texture) else {
+        return;
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    staging.used.store(crate::host::moment(), Relaxed);
+    // Levels on demand: a view of the texture now starts at another
+    // level, or another texture now starts inside its span, with no byte
+    // of its memory changed. The levels are judged anew: detiled again at
+    // this list's submission, and uploaded by this list.
+    if staging.on_demand && staging.judgement() != staging.judged() {
+        staging.forget();
+        staging.dirty.store(true, Relaxed);
+    }
+    // Levels on demand: the last upload left a held level without tiles
+    // (the card had no room, or no heap could be had), and nothing else
+    // would record an upload again until the title writes the texture: the
+    // level stayed empty, the texture blurred or black. Asked again about
+    // once a second, and only when the card has room; the staging buffer
+    // still holds the level's bytes.
+    if staging.on_demand {
+        let since = staging.waiting.load(Relaxed);
+        if since != 0 && crate::host::long_ago(since, 1000, 2) {
+            if crate::resource::room_lately() {
+                staging.waiting.store(0, Relaxed);
+                staging.dirty.store(true, Relaxed);
+                crate::tiles::STATS[10].fetch_add(1, Relaxed);
+            } else {
+                staging.waiting.store(crate::host::moment().max(1), Relaxed);
+            }
+        }
+    }
+    // The host texture has the staging buffer's contents: only the check
+    // at submission is left, and what it finds changed the next list that
+    // samples the texture uploads (a frame late where every list of the
+    // frame was recorded before that check). A hot texture is copied by
+    // every list that samples it: its check finds it changed, and the
+    // copy, which runs after the check, takes what the check detiled.
+    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) && !staging.hot_at(crate::frame::current()) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+        list.defer_texture(staging);
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    crate::framelog::add(crate::framelog::T::Uploads, 1);
+    const COPY_DEST: u32 = 0x400;
+    crate::list::ensure_state(list, resource, COPY_DEST);
+    // The staging buffer lives as long as `staging`, which the deferred
+    // refresh below holds until the list is reset.
+    for (i, footprint) in staging.footprints.iter().enumerate() {
+        #[cfg(feature = "diagnostics")]
+        {
+            let f = footprint.Footprint;
+            // SAFETY: live resources.
+            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            list.note_read(
+                || {
+                    format!(
+                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        d.Width,
+                        d.Height,
+                        d.DepthOrArraySize,
+                        d.Format.0,
+                        d.MipLevels,
+                        staging.footprints.len(),
+                        staging.size,
+                        footprint.Offset,
+                        f.Width,
+                        f.Height,
+                        f.Depth,
+                        f.RowPitch
+                    )
+                },
+                (gpu + footprint.Offset, len),
+            );
+        }
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: i as u32,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: *footprint,
+            },
+        };
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    // When the list is submitted, its copy takes what the staging buffer
+    // holds by then: noted before the check below, which sets `dirty`
+    // again if it detiles (the next list then uploads once more).
+    {
+        let staging = staging.clone();
+        list.defer_host(move || {
+            staging.uploaded.store(true, Relaxed);
+            staging.dirty.store(false, Relaxed);
+            #[cfg(feature = "diagnostics")]
+            staging.armed.store(true, Relaxed);
+        });
+    }
+    // Levels on demand (`crate::tiles`): after the check below, in the
+    // order of this list's steps, and before the list is executed, the
+    // levels the staging buffer holds as the title's are given the card's
+    // memory if they have none. The list copies every level, so each one
+    // given here is written whole by it (the rest are copies into no
+    // memory, which the card drops).
+    let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
+    let Some(on_demand) = on_demand else {
+        // Once per submission however many of its lists sample the texture.
+        list.defer_texture(staging);
+        return;
+    };
+    list.defer_texture(staging.clone());
+    list.defer_host(move || {
+        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
+        staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
+        // A texture picked by index has no staging buffer after this
+        // upload: its slots are made due again by the texture pass.
+        if waiting {
+            crate::descriptor::host::levels_waiting(staging.memory as u64);
+        }
+    });
+}
+
+/// Levels on demand: the levels a list claimed for its zeros
+/// (`crate::tiles::Tiled::claim`), held by the list's submission-time
+/// step. A list that is reset without having been submitted gives the
+/// claim up, or the next list that writes those levels would send no zeros
+/// and what its write does not cover would be what the tiles' last owner
+/// left.
+struct Claimed {
+    on_demand: crate::resource::OnDemand,
+    fresh: u32,
+    ran: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for Claimed {
+    fn drop(&mut self) {
+        if self.fresh != 0
+            && !*self.ran.get_mut()
+            && let Some(tiled) = self.on_demand.tiled()
+        {
+            tiled.unclaim(self.fresh);
+        }
+    }
+}
+
+/// Levels on demand (`crate::tiles`): the card itself is about to write
+/// title texture `resource` in `list` (a copy or a resolve into level
+/// `level`, or into every level). If its host copy `texture` was made
+/// without memory, the levels written get theirs when the list is
+/// submitted, ahead of it on the queue; the ones that have none yet are
+/// first written with zeros, here in the same list, so that what the
+/// card's write does not cover is not what the tiles' last owner left.
+/// To be called before the list is brought to the state of that write.
+/// shortcut: two lists that write the same new level, submitted in the
+/// other order than recorded, lose the first one's write under the zeros
+/// of the other; so does an upload recorded and not yet submitted.
+pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resource, level: Option<u32>) {
+    let Some(on_demand) = crate::resource::host_tiled(resource) else {
+        return;
+    };
+    let Some(tiled) = on_demand.tiled() else {
+        return;
+    };
+    let levels = match level {
+        Some(level) => tiled.with_level(level),
+        None => tiled.every_level(),
+    };
+    if levels == 0 {
+        return;
+    }
+    let fresh = tiled.claim(levels);
+    // Of them, the ones whose zeros could not be recorded.
+    let mut unzeroed = if host().is_none() { fresh } else { 0 };
+    if fresh != 0
+        && let Some(host) = host()
+    {
+        const COPY_DEST: u32 = 0x400;
+        crate::list::ensure_state(list, resource, COPY_DEST);
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        for level in (0..u32::from(d.MipLevels).min(32)).filter(|&level| fresh & (1u32 << level) != 0) {
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut bytes = 0u64;
+            // SAFETY: outputs for one subresource.
+            unsafe {
+                host.device
+                    .GetCopyableFootprints(&d, level, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
+            }
+            let Some((buffer, at, data)) = list.upload(bytes) else {
+                // (With the levels that share its tiles, if it is one of
+                // the small ones.)
+                unzeroed |= tiled.with_level(level);
+                continue;
+            };
+            // At `at` in the list's upload memory, which earlier lists may
+            // have left bytes in: the zeros are written here.
+            footprint.Offset = at;
+            // SAFETY: `bytes` bytes of mapped upload memory, the list's alone.
+            unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: level },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above; the list holds the buffer until it is reset.
+                pResource: unsafe { std::mem::transmute_copy(&buffer) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            // SAFETY: an open list; both locations name live resources.
+            unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        }
+    }
+    // A new level without its zeros gets no tiles from this list: the
+    // card's write into it is lost (the level reads zeros, as before the
+    // write), which is less wrong than a part write over what the tiles'
+    // last owner left. The next list that writes it claims it again.
+    unzeroed &= fresh;
+    if unzeroed != 0 {
+        tiled.unclaim(unzeroed);
+    }
+    let levels = levels & !unzeroed;
+    if levels == 0 {
+        return;
+    }
+    let memory = crate::resource::texture_memory(resource).map_or(0, |(memory, _)| memory as u64);
+    let step = Claimed {
+        on_demand,
+        fresh: fresh & !unzeroed,
+        ran: std::sync::atomic::AtomicBool::new(false),
+    };
+    list.defer_host(move || {
+        step.ran.store(true, std::sync::atomic::Ordering::Relaxed);
+        step.on_demand.card_wrote(levels, memory);
+    });
+}
+
+impl Staging {
+    /// Levels on demand: what says, beside the mapping, which levels of
+    /// the texture are the title's now. First the lowest level a live view
+    /// of the texture shows (0 without a view that says): the title's own
+    /// word, a texture it holds from level 3 on is viewed from level 3.
+    /// Then where the next texture placed in this one's span starts, in
+    /// bytes from this one's start (`u64::MAX`: none does): for a texture
+    /// viewed from level 0 although a neighbour sits where its large
+    /// levels would be.
+    fn judgement(&self) -> [u64; 2] {
+        let start = self.memory as u64;
+        let first = crate::descriptor::host::first_viewed(start).map_or(0, u64::from);
+        let limit = crate::descriptor::host::next_start(start, start.saturating_add(self.layout.size))
+            .map_or(u64::MAX, |at| at - start);
+        [first, limit]
+    }
+
+    /// What [`Staging::judgement`] said at the last detiling.
+    fn judged(&self) -> [u64; 2] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [self.judged[0].load(Relaxed), self.judged[1].load(Relaxed)]
+    }
+
+    /// Levels on demand: the levels that are the title's now, a bit a
+    /// level. A level is held if no view starts above it, its bytes end
+    /// before the next texture starts, and all of them are mapped. The
+    /// smallest levels share the texture's first block and are held
+    /// together. (The console layout: that block first, then the other
+    /// levels from the smallest up, level 0 last:
+    /// `victory_formats::texture::Layout`.) A texture this cannot tell
+    /// the levels of holds them all.
+    fn held_levels(&self, [first, limit]: [u64; 2]) -> u32 {
+        let mips = &self.layout.mips;
+        if self.layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
+            return u32::MAX;
+        }
+        let tail = (self.layout.first_tail_mip as usize).min(mips.len());
+        let there = |from: u64, to: u64| {
+            to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
+        };
+        let mut held = 0u32;
+        for (level, m) in mips.iter().enumerate().take(tail) {
+            let end = if level == 0 { self.layout.slice_size } else { mips[level - 1].offset };
+            if level as u64 >= first && there(m.offset, end) {
+                held |= 1 << level;
+            }
+        }
+        if tail < mips.len() && there(0, self.layout.alignment.min(self.layout.slice_size)) {
+            for level in tail..mips.len() {
+                if level as u64 >= first {
+                    held |= 1 << level;
+                }
+            }
+        }
+        held
+    }
+
+    /// Forgets what the staging buffer was last filled from: the next
+    /// refresh detiles anew, whether the memory changed or not.
+    fn forget(&self) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Last::default();
+    }
+
+    /// The title memory the texture is read from: address and bytes.
+    pub(crate) fn memory(&self) -> (usize, usize) {
+        (self.memory as usize, self.layout.size as usize)
+    }
+
+    /// Detiles the texture memory into the staging buffer if it changed
+    /// since the last time (and is mapped at all).
+    pub(crate) fn refresh(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        #[cfg(feature = "diagnostics")]
+        self.path.store(0, Relaxed);
+        let started = std::time::Instant::now();
+        let read = self.refresh_now();
+        let preparing = &crate::host::PREPARING;
+        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        preparing[3].fetch_add(read as u64, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if tracing_now() {
+            self.trace_check(read);
+        }
+    }
+
+    /// Diagnostics ([`trace_seconds`]): notes the way the check went.
+    fn took(&self, _way: u8) {
+        #[cfg(feature = "diagnostics")]
+        self.path.fetch_or(_way, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a list that samples the texture at `frame` records the copy
+    /// into its host texture even if the check found nothing new: the
+    /// check may hash it again ([`hot_level`] 2).
+    fn hot_at(&self, frame: u64) -> bool {
+        hot_level() >= 2 && frame < self.hot.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The hash found the memory changed; `first`: it was hashed for the
+    /// first time, which is no change for the hot textures.
+    fn found_changed(&self, last: &mut Last, first: bool) {
+        if !first {
+            last.changed(crate::frame::current());
+            self.hot.store(last.due_until(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The hash found the memory as it was.
+    fn found_unchanged(&self, last: &mut Last) {
+        last.unchanged(crate::frame::current(), hot_level() >= 2);
+        self.hot.store(last.due_until(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Diagnostics ([`trace_seconds`]): after a check that read `read`
+    /// bytes, hashes the memory and says which of its contents the host
+    /// texture shows once the submission's copies ran (`back`: 0 the
+    /// memory as it is, n the content n changes before, -1 none seen).
+    #[cfg(feature = "diagnostics")]
+    fn trace_check(&self, read: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let size = self.layout.size as usize;
+        let truth = with_title(self.memory, size, hash8);
+        let frame = crate::frame::current();
+        let (hot, verify) = {
+            let last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+            (frame < last.hot_until, last.verify)
+        };
+        let armed = self.armed.swap(false, Relaxed);
+        let mut t = self.trace.lock().unwrap_or_else(|e| e.into_inner());
+        t.checks += 1;
+        if armed {
+            t.host = t.staged;
+        }
+        let changed = t.seen.last() != Some(&truth);
+        if changed {
+            t.seen.push(truth);
+            if t.seen.len() > 9 {
+                t.seen.remove(0);
+            }
+        }
+        let back = t.seen.iter().rev().position(|&h| h == t.host).map_or(-1, |b| b as i64);
+        if changed || back != 0 || read > 0 || t.checks == 1 {
+            let d = &self.layout.desc;
+            tracing::info!(
+                frame,
+                at = format_args!("{:#x}", self.memory as usize),
+                bytes = size,
+                w = d.width,
+                h = d.height,
+                depth = d.depth,
+                mips = d.mips,
+                element = d.element_bytes,
+                swizzle = ?d.swizzle,
+                read,
+                path = format_args!("{:#04x}", self.path.load(Relaxed)),
+                armed,
+                hot,
+                verify,
+                back,
+                truth = format_args!("{truth:016x}"),
+                host = format_args!("{:016x}", t.host),
+                "texture trace"
+            );
+        }
+    }
+
+    /// Returns the bytes of title memory read.
+    fn refresh_now(&self) -> usize {
+        let whole = std::time::Instant::now();
+        let read = self.refresh_timed();
+        let us = whole.elapsed().as_micros() as u64;
+        REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+        crate::framelog::add(crate::framelog::T::RefreshUs, us);
+        read
+    }
+
+    fn refresh_timed(&self) -> usize {
+        let size = self.layout.size as usize;
+        let start = self.memory as usize;
+        let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
+        let last = &mut *last;
+        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                self.took(1);
+                return 0;
+            }
+            self.took(2);
+            last.asked = now;
+            // Read through the copy, which stands unmapped pages: memory of
+            // big pools is too slow to ask page by page.
+            with_read(size, |read| {
+                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                self.detile(read);
+            });
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+            return size;
+        }
+        // View memory has no write-watch, and a texture there was hashed
+        // whole at every check: 229 MB and 51 ms a frame in a gameplay view
+        // where two textures change (run 58). It is guarded now, as buffers
+        // in view memory are: a write of the title's to it faults once and
+        // is noted, a mapping is announced by the runtime. While neither
+        // happened the texture is as it was. What the guard cannot see (a
+        // write to the same pages through another view) is still found by
+        // the hash, which is taken every eighth frame only, by the
+        // texture's address, so the textures take turns.
+        // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
+            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+        {
+            const HASH_EVERY: u64 = 8;
+            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            last.asked = now;
+            // A texture the hash found changed lately is hashed at every
+            // check: the Bink video planes of the intro are written through
+            // the CPU view of their pages, which the guard does not see, and
+            // every eighth frame showed them up to seven frames late (the
+            // picture jumped between three older frames).
+            let frame = crate::frame::current();
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            let due = hot_level() >= 1 && last.hash_due(frame);
+            if unwritten && !turn && !due {
+                self.took(3);
+                return 0;
+            }
+            self.took(if !unwritten { 0x10 } else if turn { 0x20 } else { 0x30 });
+        }
+        // From here on the texture's memory may be read in place. Held until
+        // that read is done: the runtime changes what title memory shows
+        // only with this taken alone, so what `committed` finds mapped
+        // stays mapped (see `crate::watch::title_memory_reading`; without
+        // it a page went between the asking and the read in runs 71 and
+        // 74).
+        let _mapped = if no_wait() {
+            // Not waited for: while the runtime remaps title memory the
+            // texture is read through the kernel instead, whole or not at
+            // all (`no_wait`).
+            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+                self.took(4);
+                return self.refresh_unlocked(last, size);
+            };
+            mapped
+        } else {
+            waited(2, crate::watch::title_memory_reading)
+        };
+        if !committed(self.memory, size) {
+            // Partly mapped: a streamed texture with only some mips' pages
+            // there, the usual state while it streams in. Read through the
+            // copy, which stands unmapped pages (zeros), and upload what
+            // is there; nothing at all mapped changes nothing.
+            // shortcut: read again at most every 30 frames (reading around
+            // unmapped pages is slow, and nothing tells us when pages
+            // arrive): a mip that streams in shows up to 30 frames late.
+            let frame = crate::frame::current();
+            if last.partial.is_some_and(|at| frame < at + 30) {
+                self.took(5);
+                return 0;
+            }
+            self.took(6);
+            last.partial = Some(frame);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            let changed = with_read(size, |read| {
+                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                let hash = blake3::hash(read);
+                if last.hash == Some(hash) {
+                    return false;
+                }
+                last.hash = Some(hash);
+                if read.iter().all(|&b| b == 0) {
+                    return false;
+                }
+                self.detile(read);
+                true
+            });
+            #[cfg(feature = "diagnostics")]
+            if changed {
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            }
+            let _ = changed;
+            return size;
+        }
+        if through_copy() {
+            self.took(7);
+            return with_title(self.memory, size, |tiled| {
+                let hash = blake3::hash(tiled);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                if last.hash == Some(hash) {
+                    self.found_unchanged(last);
+                    return size;
+                }
+                self.found_changed(last, last.hash.is_none());
+                last.hash = Some(hash);
+                self.detile(tiled);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                size
+            });
+        }
+        self.took(8);
+        // SAFETY: committed memory of the texture's layout size, and it
+        // stays committed while `_mapped` is held.
+        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        let hash = blake3::hash(tiled);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        if last.hash == Some(hash) {
+            self.found_unchanged(last);
+            return size;
+        }
+        self.found_changed(last, last.hash.is_none());
+        last.hash = Some(hash);
+        self.detile(tiled);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        size
+    }
+
+    /// A refresh while the runtime is remapping title memory ([`no_wait`]):
+    /// the texture is read through the kernel, which fails if a page of it
+    /// is not there at this moment. Then nothing is taken and the texture
+    /// is looked at again at its next refresh (what was learnt about writes
+    /// to it is forgotten, so that it is not passed over as unwritten).
+    /// Returns the bytes read.
+    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let read = with_read(size, |read| {
+            if !crate::host::read_into(self.memory, read) {
+                return false;
+            }
+            let hash = blake3::hash(read);
+            if last.hash != Some(hash) {
+                last.hash = Some(hash);
+                self.detile(read);
+            }
+            true
+        });
+        if read {
+            UNLOCKED[0].fetch_add(1, Relaxed);
+            size
+        } else {
+            UNLOCKED[1].fetch_add(1, Relaxed);
+            last.asked = 0;
+            0
+        }
+    }
+
+    /// Detiles `tiled` (the texture's memory) into the staging buffer.
+    fn detile(&self, tiled: &[u8]) {
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Levels on demand: which levels are the title's is judged here,
+        // once, for what the staging buffer holds from now on. The step
+        // that gives levels their memory goes by this answer.
+        let held = if self.on_demand {
+            use std::sync::atomic::Ordering::Relaxed;
+            let judged = self.judgement();
+            self.judged[0].store(judged[0], Relaxed);
+            self.judged[1].store(judged[1], Relaxed);
+            let held = self.held_levels(judged);
+            self.detiled.store(held, Relaxed);
+            held
+        } else {
+            u32::MAX
+        };
+        #[cfg(feature = "diagnostics")]
+        if trace_seconds().is_some() {
+            self.trace.lock().unwrap_or_else(|e| e.into_inner()).staged = hash8(tiled);
+        }
+        #[cfg(feature = "diagnostics")]
+        if tiled.iter().all(|&b| b == 0) {
+            tracing::debug!(
+                memory = ?self.memory,
+                desc = ?self.layout.desc,
+                "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
+            );
+        }
+        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let f = footprint.Footprint;
+            let pitch = f.RowPitch as usize;
+            let len = pitch * rows as usize * f.Depth as usize;
+            // SAFETY: the subresource's part of the mapped staging buffer.
+            let linear = unsafe {
+                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+            };
+            if mip < 32 && held & (1 << mip) == 0 {
+                // Not the title's: zeros, not what lies in that memory.
+                linear.fill(0);
+                continue;
+            }
+            if let Err(e) =
+                self.layout
+                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+            {
+                tracing::warn!(?e, mip, slice, "texture not detiled");
+                return;
+            }
+        }
+    }
+}
+
+/// Lets go of a title texture's staging buffer (lists that recorded an
+/// upload from it hold it until they have run); the next upload makes one
+/// anew.
+pub(crate) fn unstage(resource: This) {
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = map.as_mut() {
+        map.remove(&(resource as usize));
+    }
+}
+
+/// Where a staged title texture's memory is: address and bytes, and the
+/// ranges of it (offsets from the address, bytes) that [`fingerprint`]
+/// reads besides its three windows: the start of every mip of every slice
+/// ([`victory_formats::texture::Layout::sample_ranges`]). None with
+/// `VICTORY_HEAP_RECHECK_MIPS=0`: the three windows alone, as before.
+pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64, Option<std::sync::Arc<[(u64, u64)]>>)> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let staging = map.as_ref()?.get(&(resource as usize))?;
+    let (at, len) = staging.memory();
+    let mips = recheck_mips().then(|| staging.layout.sample_ranges(MIP_WINDOW, MIP_RANGES).into());
+    Some((at as u64, len as u64, mips))
+}
+
+/// Bytes [`fingerprint`] reads at the start of each mip, and the most mips
+/// it reads of one texture (spread over its slices and mips when it has
+/// more). A 4096-square texture with all its mips: 10 reads, 12 KiB; a cube
+/// map with 10 mips: 40 reads, 52 KiB.
+const MIP_WINDOW: u64 = 1 << 10;
+const MIP_RANGES: usize = 64;
+
+/// Whether [`fingerprint`] also reads the start of every mip of every
+/// slice (`VICTORY_HEAP_RECHECK_MIPS=0`: no).
+fn recheck_mips() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK_MIPS").is_none_or(|v| v != "0"))
+}
+
+/// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
+/// it up to 48 KiB, else of 16 KiB at its start, its middle and its end,
+/// and of the ranges `mips` (offsets from `at`, bytes; see
+/// [`staged_memory`]). A texture streams in whole mips, and the three
+/// windows alone see only the smallest mips and mip 0 of a plain texture,
+/// and only two slices of an array or cube map: a mip or slice that
+/// arrived after the upload elsewhere was not seen. Read through the
+/// kernel, so pages not there count as zeros.
+pub(crate) fn fingerprint(at: u64, len: u64, mips: &[(u64, u64)]) -> u64 {
+    const WINDOW: usize = 16 << 10;
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let len = len as usize;
+    let mut hasher = blake3::Hasher::new();
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        let longest = mips.iter().map(|&(_, n)| n as usize).max().unwrap_or(0);
+        read.resize((3 * WINDOW).max(longest), 0);
+        let mut take = |from: usize, bytes: usize| {
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+            hasher.update(&read[..bytes]);
+        };
+        if len <= 3 * WINDOW {
+            take(0, len);
+        } else {
+            take(0, WINDOW);
+            take((len / 2) & !0xfff, WINDOW);
+            take(len - WINDOW, WINDOW);
+            for &(from, bytes) in mips {
+                let from = from as usize;
+                if from < len {
+                    take(from, (bytes as usize).min(len - from));
+                }
+            }
+        }
+    });
+    let hash = hasher.finalize();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_le_bytes(first) | 1
+}
+
+/// Whether a title texture has a staging buffer: a list recorded its
+/// upload, and the lists that sample it check it at submission.
+/// For the frame listing: whether a list has uploaded `resource`'s staging
+/// buffer, and whether it was detiled since. None: it has none.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let staging = map.as_ref()?.get(&(resource as usize))?;
+    Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
+}
+
+pub(crate) fn is_staged(resource: This) -> bool {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
+}
+
+/// The bytes of a title texture's memory, and whether all of it is mapped,
+/// if the texture has been staged for upload.
+pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
+    let s = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref()?.get(&(resource as usize))?.clone()
+    };
+    let size = s.layout.size as usize;
+    Some((size as u64, committed(s.memory, size)))
+}
+
+/// Whether `[at, at + len)` is committed memory (streamed textures may be
+/// unmapped until their pages arrive).
+pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    if by_query() {
+        return committed_by_query(at, len);
+    }
+    if len == 0 {
+        return true;
+    }
+    let (there, of) = readable(at as usize, len, true);
+    there == of
+}
+
+/// Whether the two questions above and below are put to `VirtualQuery`, as
+/// they were (`VICTORY_COMMITTED_QUERY=1`). `VirtualQuery` answers with the
+/// length of the run of pages in the same state, which it finds by walking
+/// the page tables to the run's end: 8.8 ms for one question in the title's
+/// 1.1 GB block (round 6). The pass over the heap's views asks three or
+/// more of them for every texture slot that is due, 3,000 slots a frame
+/// when the card has no room (run 75): that pass then ran 208-264 ms, and
+/// while it ran the submitting thread's write-watch askings waited behind
+/// the walks (run 76: 8-22 askings a frame of 6-21 ms each, 46-172 ms).
+fn by_query() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMMITTED_QUERY").is_some_and(|v| v == "1"))
+}
+
+/// Of the kernel's pages that hold `[at, at + len)` (`len > 0`): how many
+/// can be read, and how many there are; with `all`, it stops at the first
+/// that cannot. One question to the kernel for up to 256 pages at once
+/// (`QueryWorkingSetEx`: the state of each page asked about, no walk); a
+/// page not in the working set may still be there (never touched, or
+/// trimmed), and a one-byte read through the kernel says.
+/// A page that is committed and may not be read counts as not there, which
+/// is what the callers ask for: they read or write the memory next.
+fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const KERNEL_PAGE: usize = 4096;
+    let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
+    let of = last - first + 1;
+    let mut there = 0;
+    // SAFETY: plain data.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    let mut page = first;
+    while page <= last {
+        let n = (last - page + 1).min(info.len());
+        for (i, entry) in info[..n].iter_mut().enumerate() {
+            entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
+        }
+        // SAFETY: `n` entries of the size given; our own process.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr().cast(),
+                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        for (i, entry) in info[..n].iter().enumerate() {
+            // Bit 0 of the answer: the page is in the working set.
+            // SAFETY: plain data the query filled in.
+            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+            let mut byte = [0u8];
+            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+                there += 1;
+            } else if all {
+                return (there, of);
+            }
+        }
+        page += n;
+    }
+    (there, of)
+}
+
+fn committed_by_query(at: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut p = at as usize;
+    let end = p + len;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State != MEM_COMMIT {
+            return false;
+        }
+        p = info.BaseAddress as usize + info.RegionSize;
+    }
+    true
+}
+
+/// How many bytes of `[at, at + len)` are committed memory: all of a
+/// texture that is there, some of one streaming in (its smaller mips lie
+/// at the start of its memory, and their pages are mapped first), none of
+/// one not there. With neither the first nor the last page committed the
+/// answer is none without a look at the pages between (two queries for the
+/// slots whose texture is away, which are asked again and again).
+pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    if len == 0 {
+        return 0;
+    }
+    let start = at as usize;
+    let end = start.saturating_add(len);
+    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+        return 0;
+    }
+    if !by_query() {
+        static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
+            // By page, without the walk: whole pages, cut to the range.
+            let (there, _) = readable(start, len, false);
+            return (there as u64 * 4096).min(len as u64);
+        }
+        // By 64 KiB block, one page asked of each: the title's memory is
+        // mapped in blocks of that size (the console's page), and the
+        // answer is a measure of how much of a texture has arrived, not a
+        // promise that every byte can be read (the upload reads through the
+        // kernel). By page, a texture half there cost a failed kernel read
+        // for each of its missing pages, every frame it stayed due: 1,663
+        // textures "uploaded in part" kept the pass over the heap's views at
+        // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
+        const BLOCK: usize = 64 << 10;
+        let mut there = 0u64;
+        let mut block = start & !(BLOCK - 1);
+        while block < end {
+            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
+            if readable(lo, 1, true).0 == 1 {
+                there += (hi - lo) as u64;
+            }
+            block = block.saturating_add(BLOCK);
+        }
+        return there;
+    }
+    let (mut p, mut there) = (start, 0u64);
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        if n == 0 || next <= p {
+            break;
+        }
+        if info.State == MEM_COMMIT {
+            there += (next - p) as u64;
+        }
+        p = next;
+    }
+    there
+}
+
+/// The staging state of a title texture, made on first use.
+fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+    // Asked before the table is locked: the sweep lets go of a staging
+    // buffer with its texture's host side locked, in that order.
+    let on_demand = crate::resource::host_tiled(resource).is_some();
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    if let Some(s) = map.get(&(resource as usize)) {
+        return Some(s.clone());
+    }
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
+    else {
+        once!(
+            ?desc,
+            "texture contents without a console layout not uploaded"
+        );
+        return None;
+    };
+    if layout.desc.swizzle.xor() {
+        once!(?desc, "texture contents in an XOR mode not uploaded");
+        return None;
+    }
+    let host = host()?;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        u32::from(d.MipLevels)
+    } else {
+        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
+    };
+    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+    let mut rows = vec![0u32; count as usize];
+    let mut total = 0;
+    // SAFETY: outputs for `count` subresources.
+    unsafe {
+        host.device.GetCopyableFootprints(
+            &d,
+            0,
+            count,
+            0,
+            Some(footprints.as_mut_ptr()),
+            Some(rows.as_mut_ptr()),
+            None,
+            Some(&mut total),
+        );
+    }
+    let (buffer, data, pooled) = staging_buffer(host, total)?;
+    crate::host::name(&buffer, || {
+        format!(
+            "staging of {resource:?} {}x{}x{} f{}",
+            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+        )
+    });
+    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    let s = Arc::new(Staging {
+        buffer,
+        #[cfg(feature = "diagnostics")]
+        size: total,
+        data,
+        footprints,
+        rows,
+        layout,
+        mips: u32::from(d.MipLevels),
+        bytes: total,
+        memory,
+        last: Mutex::default(),
+        dirty: std::sync::atomic::AtomicBool::new(true),
+        uploaded: std::sync::atomic::AtomicBool::new(false),
+        used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        hot: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(feature = "diagnostics")]
+        path: std::sync::atomic::AtomicU8::new(0),
+        #[cfg(feature = "diagnostics")]
+        armed: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "diagnostics")]
+        trace: Mutex::default(),
+        on_demand,
+        detiled: std::sync::atomic::AtomicU32::new(0),
+        judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
+        waiting: std::sync::atomic::AtomicU64::new(0),
+        pooled,
+    });
+    map.insert(resource as usize, s.clone());
+    add_to_address_index(&s);
+    Some(s)
+}
+
+#[cfg(test)]
+mod remap_tests {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// After a remap of the memory under a texture that was already
+    /// uploaded, the texture must be uploaded again (#574). A remap of
+    /// unrelated memory, or of an empty range, must leave it alone.
+    #[test]
+    fn a_remap_under_a_staged_texture_makes_it_upload_again() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE_RUN: usize = 0x1_0000;
+        // Two 64 KiB runs: the texture lives in the first, the second is
+        // memory next to it that no texture uses.
+        // SAFETY: a private allocation of our own, released at the end.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE_RUN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!base.is_null());
+        let texture_start = base as usize;
+        // Resource description words of a linear 4x4 RGBA8 texture with one
+        // mip level, the shape the issue used to reproduce the bug.
+        let description = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 1, 0, 0];
+        let staged = crate::resource::texture_at(texture_start as u64, &description).and_then(|resource| {
+            let host_texture = crate::resource::host_resource(resource)?;
+            super::staging(resource, host_texture)
+        });
+        // `None` means there is no GPU to make the host texture on: nothing
+        // to check then.
+        if let Some(staging) = staged {
+            // The state after a submitted list uploaded the texture.
+            staging.uploaded.store(true, Relaxed);
+            staging.dirty.store(false, Relaxed);
+
+            super::remapped(texture_start + PAGE_RUN, PAGE_RUN);
+            super::remapped(texture_start, 0);
+            assert!(!staging.dirty.load(Relaxed), "a remap elsewhere marked the texture");
+
+            super::remapped(texture_start + 0x10, 0x10);
+            assert!(staging.dirty.load(Relaxed), "a remap under the texture did not mark it");
+        }
+        // SAFETY: the allocation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// A write the guards do not see under a staged texture that was
+    /// uploaded (a texture draws read through a table) has it read again
+    /// once the write settled: before that it is left alone, and a write
+    /// elsewhere does nothing.
+    #[test]
+    fn a_page_write_under_an_uploaded_staged_texture_reads_it_again_once_settled() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE_RUN: usize = 0x1_0000;
+        // SAFETY: a private allocation of our own, released at the end.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE_RUN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!base.is_null());
+        let texture_start = base as usize;
+        let description = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 1, 0, 0];
+        let staged = crate::resource::texture_at(texture_start as u64, &description).and_then(|resource| {
+            let host_texture = crate::resource::host_resource(resource)?;
+            super::staging(resource, host_texture)
+        });
+        // `None`: no GPU to make the host texture on.
+        if let Some(staging) = staged {
+            staging.uploaded.store(true, Relaxed);
+            staging.dirty.store(false, Relaxed);
+            staging.last.lock().unwrap().asked = 7;
+            let at = texture_start as u64;
+            // Frames far from any other test's, so the once-a-frame gate is ours.
+            super::page_written(&[(at + PAGE_RUN as u64, at + 2 * PAGE_RUN as u64)], 1_000);
+            super::page_written(&[(at + 0x10, at + 0x20)], 1_000);
+            super::page_written(&[(at + 0x20, at + 0x30)], 1_100);
+            assert_eq!(super::page_settled(1 << 40, 1_200, 200, 2_000), 0, "read again before its writes settled");
+            assert!(!staging.dirty.load(Relaxed));
+            assert_eq!(staging.last.lock().unwrap().asked, 7);
+            assert_eq!(super::page_settled((1 << 40) + 1, 1_300, 200, 2_000), 1, "not read again once settled");
+            assert!(staging.dirty.load(Relaxed), "not marked for the next list's upload");
+            assert_eq!(staging.last.lock().unwrap().asked, 0, "what the staging buffer holds was not forgotten");
+        }
+        // SAFETY: the allocation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// Settling: a write again under a settling key moves its last write
+    /// on; keys are taken once quiet or after the longest wait, oldest
+    /// first, within the count and byte bounds (the first whatever its size).
+    #[test]
+    fn settling_takes_quiet_or_old_keys_oldest_first_within_bounds() {
+        let mut s = super::Settling::<usize>::new();
+        assert!(!s.note(1, 100, 10, || 1));
+        assert!(!s.note(2, 150, 10, || 2));
+        assert!(s.note(1, 250, 10, || 99));
+        // Key 1 was written at 250: not quiet at 400; key 2 is.
+        assert_eq!(s.settled(400, 200, 2_000, 64, 1 << 20), vec![2]);
+        // Written again and again, key 1 is taken 2 s after its first write.
+        assert!(s.note(1, 2_050, 10, || 99));
+        assert_eq!(s.settled(2_099, 200, 2_000, 64, 1 << 20), Vec::<usize>::new());
+        assert_eq!(s.settled(2_100, 200, 2_000, 64, 1 << 20), vec![1]);
+        assert_eq!(s.len(), 0);
+        // Bounds: two a call, then bytes; the oldest go first.
+        for (key, first) in [(5, 30), (6, 10), (7, 20)] {
+            s.note(key, first, 100, || key);
+        }
+        assert_eq!(s.settled(1_000, 200, 2_000, 2, 1 << 20), vec![6, 7]);
+        assert!(!s.note(8, 40, 1_000, || 8));
+        assert_eq!(s.settled(1_000, 200, 2_000, 64, 150), vec![5]);
+        assert_eq!(s.settled(1_000, 200, 2_000, 64, 150), vec![8]);
+    }
+}
+
+#[cfg(test)]
+mod title_memory_tests {
+    use super::with_title;
+
+    /// Title memory whose tail is reserved and not committed reads through
+    /// the copy as its bytes and then zeros, without a fault; so does
+    /// memory a page of which is taken away between two reads, and the
+    /// zeros are zeros whatever the read buffer held before.
+    #[test]
+    fn an_uncommitted_tail_reads_as_zeros() {
+        use windows_sys::Win32::System::Memory::*;
+        const HEAD: usize = 0xb_0000;
+        const SIZE: usize = 0x20_0000;
+        // SAFETY: a private reservation of our own; only committed pages
+        // are written in place, and nothing else reads them in place.
+        unsafe {
+            // The read buffer holds something else first.
+            let other = vec![0x77u8; SIZE];
+            with_title(other.as_ptr(), SIZE, |bytes| assert!(bytes.iter().all(|&b| b == 0x77)));
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), HEAD, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            base.write_bytes(0x5a, HEAD);
+            with_title(base, SIZE, |bytes| {
+                assert!(bytes[..HEAD].iter().all(|&b| b == 0x5a), "what is mapped");
+                assert!(bytes[HEAD..].iter().all(|&b| b == 0), "what is not: zeros");
+            });
+            // The title takes a page in the middle away: zeros from then
+            // on, the rest as before.
+            assert_ne!(VirtualFree(base.add(0x4_0000).cast(), 0x1_0000, MEM_DECOMMIT), 0);
+            with_title(base, SIZE, |bytes| {
+                assert!(bytes[..0x4_0000].iter().all(|&b| b == 0x5a));
+                assert!(bytes[0x4_0000..0x5_0000].iter().all(|&b| b == 0));
+                assert!(bytes[0x5_0000..HEAD].iter().all(|&b| b == 0x5a));
+                assert!(bytes[HEAD..].iter().all(|&b| b == 0));
+            });
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// The texture both device-loss runs named last (16 texels wide, 4 or 8
+    /// high, format 10, layout 0x100, console flags 0x300000; its memory
+    /// began 0x300 into a page in run 73 and 0x700 in run 72, and here also
+    /// 0xf00, so that a page line runs through it): what the detiling is
+    /// given and what it writes are the same read in place and read through
+    /// the copy, and the rows it writes end where the staging buffer the
+    /// host sizes for it ends (896 bytes for 4 rows of 128 bytes 256 apart,
+    /// 1,920 for 8).
+    #[test]
+    fn the_small_texture_of_runs_72_and_73_detiles_the_same_both_ways() {
+        use windows_sys::Win32::System::Memory::*;
+        for (height, within) in [(4u32, 0x300usize), (8, 0x700), (4, 0xf00), (8, 0xf00)] {
+            // The description as the log printed it, word for word.
+            let words: [u32; 14] = [3, 0, 0, 0, 16, 0, height, 65537, 10, 1, 0, 256, 3_145_728, 0];
+            // SAFETY: fourteen words are a resource description (56 bytes,
+            // plain numbers).
+            let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+            let layout = crate::resource::texture_layout(&desc)
+                .expect("a console layout")
+                .planes[0]
+                .layout
+                .clone();
+            let size = layout.size as usize;
+            let (row, pitch) = (16 * 8, 256usize);
+            assert!(size >= row * height as usize, "the layout holds every texel");
+            // Committed pages and a reserved one after them; the texture
+            // begins `within` bytes into the first, as the title placed it.
+            // SAFETY: our own reservation; the committed part is written
+            // and read in place, by this thread alone.
+            unsafe {
+                let pages = size.div_ceil(4096) + 1;
+                let base = VirtualAlloc(std::ptr::null(), (pages + 1) * 4096, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+                assert!(!base.is_null());
+                assert_eq!(VirtualAlloc(base.cast(), pages * 4096, MEM_COMMIT, PAGE_READWRITE), base.cast());
+                for i in 0..pages * 4096 {
+                    base.add(i).write((i * 7 + i / 251) as u8);
+                }
+                let memory = base.add(within);
+                let in_place = std::slice::from_raw_parts(memory, size);
+                // The bytes: the same in place and through the copy.
+                with_title(memory, size, |copied| assert_eq!(copied, in_place));
+                // What the detiling writes: the same, and inside the bytes
+                // the host's staging buffer for this texture has.
+                let staged = (height as usize - 1) * pitch + row;
+                assert_eq!(staged, if height == 4 { 896 } else { 1920 });
+                let detile = |tiled: &[u8]| {
+                    // The slice `Staging::detile` hands over: whole rows.
+                    let mut linear = vec![0xeeu8; pitch * height as usize];
+                    layout
+                        .detile(tiled, 0, 0, &mut linear, pitch, pitch * height as usize)
+                        .expect("detiled");
+                    linear
+                };
+                let direct = detile(in_place);
+                let through = with_title(memory, size, |copied| detile(copied));
+                assert_eq!(direct, through);
+                for y in 0..height as usize {
+                    assert!(direct[y * pitch..][..row].iter().any(|&b| b != 0xee), "row {y} written");
+                    assert!(direct[y * pitch + row..(y + 1) * pitch].iter().all(|&b| b == 0xee), "nothing past row {y}");
+                }
+                // A buffer of exactly the staged bytes is enough.
+                let mut exact = vec![0u8; staged];
+                layout
+                    .detile(in_place, 0, 0, &mut exact, pitch, pitch * height as usize)
+                    .expect("the staging buffer's bytes are enough");
+                assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod hot_texture_tests {
+    use super::{HOT_FRAMES, Last, VERIFY_FRAMES};
+
+    /// A video's planes cycle through a ring of three textures, each sampled
+    /// and checked every third frame, and each found changed at every check:
+    /// from the second change on the texture is hot, and stays so.
+    #[test]
+    fn a_texture_changing_at_every_check_goes_hot() {
+        let mut last = Last::default();
+        last.changed(10);
+        assert!(!last.hash_due(10), "the check that found the change is done");
+        assert!(last.hash_due(13), "the next check verifies it");
+        last.changed(13);
+        assert!(last.hash_due(14), "changed twice: hot");
+        last.changed(16);
+        assert!(last.hash_due(16 + HOT_FRAMES - 1));
+    }
+
+    /// A texture that streams in changes once: it is hashed once more at its
+    /// next checks, found as it was, and not hashed again between turns.
+    #[test]
+    fn a_texture_that_changed_once_is_not_hot() {
+        let mut last = Last::default();
+        last.changed(100);
+        assert!(last.hash_due(101), "verified at the next check");
+        last.unchanged(101, true);
+        assert!(last.hash_due(102), "the frame after the change proves nothing");
+        last.unchanged(102, true);
+        assert!(!last.hash_due(103));
+        assert!(!last.hash_due(100 + VERIFY_FRAMES));
+        // A change long after the first is a first change again.
+        last.changed(500);
+        assert!(!last.hash_due(500));
+        assert!(last.hash_due(501));
+    }
+
+    /// At the start of the intro movie a plane of the ring was found
+    /// changed in frame 1008, as it was at a check in frame 1009, and its
+    /// next changes were passed over until its turn (run intro-t1): the
+    /// check in the next frame does not end the verifying any more.
+    #[test]
+    fn a_check_in_the_next_frame_keeps_the_verifying() {
+        let mut last = Last::default();
+        last.changed(1008);
+        last.unchanged(1009, true);
+        assert!(last.hash_due(1011));
+        last.changed(1011);
+        assert!(last.hash_due(1012), "changed again: hot");
+        // As before (`VICTORY_TEXTURE_HOT=1`): the check ended it.
+        let mut old = Last::default();
+        old.changed(1008);
+        old.unchanged(1009, false);
+        assert!(!old.hash_due(1011));
+    }
+
+    /// Lists record the copy while the next check may hash the texture.
+    #[test]
+    fn due_until_covers_the_verifying_and_the_hot_frames() {
+        let mut last = Last::default();
+        assert_eq!(last.due_until(), 0);
+        last.changed(10);
+        assert_eq!(last.due_until(), 10 + VERIFY_FRAMES + 1);
+        last.changed(13);
+        assert_eq!(last.due_until(), (13 + HOT_FRAMES).max(13 + VERIFY_FRAMES + 1));
+        last.unchanged(20, true);
+        assert_eq!(last.due_until(), 13 + HOT_FRAMES);
+    }
+
+    /// A hot texture that stops changing falls back to the turns.
+    #[test]
+    fn a_hot_texture_cools_down() {
+        let mut last = Last::default();
+        last.changed(1);
+        last.changed(4);
+        assert!(last.hash_due(4 + HOT_FRAMES - 1));
+        last.unchanged(10, true);
+        assert!(!last.hash_due(4 + HOT_FRAMES + 1));
+    }
+}
