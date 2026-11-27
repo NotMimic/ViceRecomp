@@ -1,6 +1,6 @@
-# Contributing to Victory Grimkaaah
+# Contributing to ViceRecomp
 
-Thank you for helping. Victory Grimkaaah moves forward by one rule: **a change is
+Thank you for helping. ViceRecomp moves forward by one rule: **a change is
 kept only if it is measured better.** These rules keep issues and pull requests
 useful and the project going in one direction.
 
