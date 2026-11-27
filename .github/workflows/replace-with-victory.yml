@@ -1,0 +1,42 @@
+name: Replace repository with Victory source
+
+on:
+  push:
+    paths:
+      - ".github/workflows/replace-with-victory.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  replace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Replace repository files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/Grimkaaah/Victory-Grimkaaah.git /tmp/victory
+          mkdir -p /tmp/keep/assets
+          if [ -f assets/logo.png ]; then cp assets/logo.png /tmp/keep/assets/logo.png; fi
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          cp -a /tmp/victory/. .
+          mkdir -p assets
+          if [ -f /tmp/keep/assets/logo.png ]; then cp /tmp/keep/assets/logo.png assets/logo.png; fi
+          if [ -f README.md ]; then
+            sed -i 's/Victory-Grimkaaah/ViceRecomp/g; s/Grimkaaah/ViceRecomp/g' README.md
+            sed -i 's|assets/logo.png|assets/logo.png|g' README.md
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Replace repository files with Victory source"
+            git push origin HEAD:main
+          fi
