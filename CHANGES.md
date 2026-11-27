@@ -1,6 +1,6 @@
-# Changes in Victory Grimkaaah
+# Changes in ViceRecomp
 
-Victory Grimkaaah is a modified version of the open-source Victory compatibility
+ViceRecomp is a modified version of the open-source Victory compatibility
 layer (GNU GPL v3.0 or later, see [source/LICENSE](source/LICENSE)). This file lists
 every change made for Victory Grimkaaah, with its date. Every code change is off by
 default in the code and turned on, when it measured better, by `tools\settings.ps1`.
@@ -15,7 +15,7 @@ with a 96 GB page file, AMD Radeon RX 7900 XTX 24 GB, Xbox Series X profile, 4K 
 
 ### Launcher and tools (new, 2026-11-26 and 2026-11-27)
 
-- `Victory Grimkaaah.bat` and `tools\play.ps1`: the launcher. A menu (Quality,
+- `ViceRecomp.bat` and `tools\play.ps1`: the launcher. A menu (Quality,
   Fluidity, Diagnostic), checks before starting, one log per session, the frame rate
   every 10 s, a report at the end and the end of the crash report if the session
   ended on one. `-Mode`, `-Check` (a dry run that shows every setting and the exact
