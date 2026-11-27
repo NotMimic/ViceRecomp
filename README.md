@@ -1,6 +1,6 @@
 # ViceRecomp
 
-**ViceRecomp** is my build of the Victory compatibility layer: it runs an
+**ViceRecomp** is a new type of the Victory compatibility layer: it runs an
 Xbox Series X title natively on Windows, on an AMD Radeon RX 7900 XTX, from files
 you supply yourself. It comes with its own launcher, its own tuned settings and my
 own changes to the code, each one measured on my PC before being kept.
@@ -18,7 +18,7 @@ own changes to the code, each one measured on my PC before being kept.
 > your own copy of the title. It is not affiliated with or endorsed by the
 > title's developer or publisher.
 
-## My PC
+## my PC
 
 | | |
 |---|---|
