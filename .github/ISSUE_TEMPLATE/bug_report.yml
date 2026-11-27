@@ -1,0 +1,70 @@
+name: Bug report
+description: Something is wrong (crash, card loss, wrong picture, launcher error).
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Victory Grimkaaah is for **AMD Radeon cards only**. Never attach or link game files, and do not name the title: write "the title".
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and when (at start, in a cinematic, after N minutes...).
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Quality (ray tracing)
+        - Fluidity (no ray tracing)
+        - Diagnostic
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: AMD graphics card and driver version
+      placeholder: "Radeon RX 7900 XTX, Adrenalin 25.x"
+    validations:
+      required: true
+  - type: input
+    id: pc
+    attributes:
+      label: CPU, RAM and page file size
+      placeholder: "Ryzen 9 7950X3D, 32 GB, page file 98304 MB"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Victory Grimkaaah version or commit
+      placeholder: "1.0 or a commit hash"
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Session report
+      description: Paste logs\report-<date>.txt (and the end of the crash report if the launcher showed one).
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I use my own copy of the title, and I attached no game files.
+          required: true
+        - label: I searched the existing issues first.
+          required: true

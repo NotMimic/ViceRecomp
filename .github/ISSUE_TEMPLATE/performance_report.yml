@@ -1,0 +1,51 @@
+name: Performance report
+description: Your frame rate, freezes or memory use, measured with the launcher's report.
+title: "[Perf] "
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Reports from **AMD Radeon cards** only. Attach the launcher's session report: numbers without a report cannot be compared.
+  - type: input
+    id: gpu
+    attributes:
+      label: AMD graphics card and driver version
+    validations:
+      required: true
+  - type: input
+    id: pc
+    attributes:
+      label: CPU, RAM and page file size
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Quality (ray tracing)
+        - Fluidity (no ray tracing)
+        - Diagnostic
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Victory Grimkaaah version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: scene
+    attributes:
+      label: Where you played and what you noticed
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Session report
+      description: Paste logs\report-<date>.txt.
+      render: text
+    validations:
+      required: true
