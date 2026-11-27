@@ -1,6 +1,6 @@
-# Victory Grimkaaah: source code
+# ViceRecomp
 
-This folder holds the source code of Victory Grimkaaah.
+This folder holds the source code of ViceRecomp
 
 - What it is, the performance and how to use it: [../README.md](../README.md)
 - Every change, with its date: [../CHANGES.md](../CHANGES.md)
