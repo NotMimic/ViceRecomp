@@ -16,27 +16,56 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Replace repository files
         shell: bash
         run: |
           set -euo pipefail
+
           git clone --depth 1 https://github.com/Grimkaaah/Victory-Grimkaaah.git /tmp/victory
-          mkdir -p /tmp/keep/assets
-          if [ -f assets/logo.png ]; then cp assets/logo.png /tmp/keep/assets/logo.png; fi
-          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
-          cp -a /tmp/victory/. .
-          mkdir -p assets
-          if [ -f /tmp/keep/assets/logo.png ]; then cp /tmp/keep/assets/logo.png assets/logo.png; fi
-          if [ -f README.md ]; then
-            sed -i 's/Victory-Grimkaaah/ViceRecomp/g; s/Grimkaaah/ViceRecomp/g' README.md
-            sed -i 's|assets/logo.png|assets/logo.png|g' README.md
+
+          if [ -f assets/logo.png ]; then
+            mkdir -p /tmp/vice-recomp-backup
+            cp assets/logo.png /tmp/vice-recomp-backup/logo.png
           fi
+
+          rsync -a --delete --exclude='.git' /tmp/victory/ ./
+
+          mkdir -p assets
+          if [ -f /tmp/vice-recomp-backup/logo.png ]; then
+            cp /tmp/vice-recomp-backup/logo.png assets/logo.png
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          readme = Path("README.md")
+          if readme.exists():
+              content = readme.read_text(encoding="utf-8")
+              content = content.replace(
+                  "Grimkaaah/Victory-Grimkaaah",
+                  "NotMimic/ViceRecomp"
+              )
+              content = content.replace("Victory-Grimkaaah", "ViceRecomp")
+              content = content.replace("Victory Grimkaaah", "ViceRecomp")
+              lines = content.splitlines()
+              if lines and lines[0].startswith("# "):
+                  lines[0] = "# ViceRecomp"
+                  content = "\n".join(lines) + "\n"
+              else:
+                  content = "# ViceRecomp\n\n" + content
+              readme.write_text(content, encoding="utf-8")
+          PY
+
+          rm -f .github/workflows/replace-with-victory.yml
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
+
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Replace repository files with Victory source"
+            git commit -m "Replace repository contents with ViceRecomp source"
             git push origin HEAD:main
           fi
