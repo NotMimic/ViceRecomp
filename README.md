@@ -1,4 +1,16 @@
-# ViceRecomp
+<p align="center">    
+  <img src="assets/logo.png" width="200" alt="Logo">    
+</p>    
+    
+<div align="center">    
+    
+# ViceRecomp    
+    
+</div>    
+    
+**The site is at:**    
+    
+https://vicerecomp.netlify.app/
 
 **ViceRecomp** is a new type of the Victory compatibility layer: it runs an
 Xbox Series X title natively on Windows, on an AMD Radeon RX 7900 XTX, from files
